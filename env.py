@@ -1,0 +1,495 @@
+import numpy as np
+import gymnasium as gym
+from gymnasium.envs.registration import register
+
+from qiskit import QuantumCircuit
+from qiskit.circuit.library import HGate, XGate, YGate, ZGate, TGate, CXGate
+from qiskit.quantum_info import Operator
+
+import warnings
+warnings.simplefilter(action='ignore', category=np.ComplexWarning)
+
+
+class CircuitDesignerDiscrete(gym.Env):
+    """离散动作空间的量子电路重构环境（仅重建目标电路）。"""
+
+    metadata = {"render_modes": ["image", "text"], "render_fps": 30}
+
+    def __init__(
+        self,
+        max_qubits: int,
+        max_gates: int,
+        max_depth: int,
+        task_pool=None,
+        train_tasks=None,
+        test_tasks=None,
+        seed=None,
+        render_mode=None,
+        fidelity_threshold: float = 0.99,
+        success_reward: float = 5.0,
+        fail_reward: float = -5.0,
+    ):
+        super().__init__()
+        self._np_random, _ = gym.utils.seeding.np_random(seed)
+
+        # 兼容：优先使用 train_tasks/test_tasks，否则回退 task_pool（同时作为训练和测试）
+        if (train_tasks is None or test_tasks is None) and task_pool is None:
+            raise ValueError("需提供 train_tasks/test_tasks 或 task_pool。")
+        self.train_tasks = train_tasks if train_tasks is not None else task_pool
+        self.test_tasks = test_tasks if test_tasks is not None else task_pool
+        if not self.train_tasks or not self.test_tasks:
+            raise ValueError("任务列表不能为空。")
+
+        self.render_mode = render_mode
+        self.name = f"REBUILD|{max_qubits}-g{max_depth}"
+
+        self.max_qubits = max_qubits
+        self.n_qubits = max_qubits
+        self.max_gates = max_gates  ## max_gates <= max_depth * n_qubits
+        self.max_depth = max_depth
+        self.fidelity_threshold = fidelity_threshold
+        self.success_reward = success_reward
+        self.fail_reward = fail_reward
+        
+
+        self._qc = QuantumCircuit(self.n_qubits)
+        self.qc_operator = Operator(self._qc) 
+        self.current_depth = self._qc.depth()
+        self.current_gates = len(self._qc.data)
+        self.target_qc = None
+        self.target_unitary = None
+        self.current_task_id = None
+        self.current_length_bin = None ## 当前任务的“长度分箱/难度档位”标签
+        self.gate_tokens = []
+        self._qubit_stacks = [[] for _ in range(self.n_qubits)]
+        self.fidelities = []
+
+        # 预计算局部酉矩阵（用于 redundancy 判定）
+        self._localU_1q, self._localU_2q = self._build_local_unitaries()
+        self._eps_comm = 1e-8
+        self._eps_gate = 1e-8
+
+        # 定义门类型
+        self.gates = ['H', 'X', 'Y', 'Z', 'T', 'CNOT']
+        self.single_gates = ['H', 'X', 'Y', 'Z', 'T']  # 单量子比特门
+        self.two_gates = ['CNOT']  # 双量子比特门
+
+        # 离散动作空间：为每种可能的门-量子比特组合分配一个动作ID
+        self.action_mapping = self._create_action_mapping()
+        self.action_space = gym.spaces.Discrete(len(self.action_mapping))
+
+        # 观察空间：定长门序列，padding=-1
+        self.observation_space = gym.spaces.Box(
+            low=-1,
+            high=len(self.action_mapping) - 1,
+            shape=(self.max_gates,),
+            dtype=np.int32,
+        )
+
+        print(f"Created {len(self.action_mapping)} discrete actions")
+
+    def _create_action_mapping(self):
+        """创建动作ID到(门类型, 量子比特)的映射"""
+        actions = []
+
+        # 单量子比特门：每个门在每个量子比特上
+        for gate in self.single_gates:
+            for qubit in range(self.n_qubits):
+                actions.append({'gate': gate, 'target': qubit, 'control': None})
+
+        # 双量子比特门：每个门在每对不同量子比特上
+        for gate in self.two_gates:
+            for control in range(self.n_qubits):
+                for target in range(self.n_qubits):
+                    if control != target:  # 控制和目标量子比特必须不同
+                        actions.append({'gate': gate, 'target': target, 'control': control})
+
+        return actions
+
+    def _build_local_unitaries(self):
+        """构建局部酉矩阵缓存，避免在 mask 中重复计算。"""
+        u1 = {}
+        for gate_name, gate_cls in [('H', HGate), ('X', XGate), ('Y', YGate), ('Z', ZGate), ('T', TGate)]:
+            qc = QuantumCircuit(1)
+            qc.append(gate_cls(), [0])
+            u1[gate_name] = Operator(qc).data
+
+        qc2 = QuantumCircuit(2)
+        qc2.append(CXGate(), [0, 1])
+        u2 = {'CNOT': Operator(qc2).data}
+        return u1, u2
+
+    def _parse_task(self, task):
+        """解析任务条目，返回 (task_id, target_qc, length_bin, n_qubits)。"""
+        task_id = None
+        target_qc = None
+        length_bin = None
+        n_qubits = None
+
+        if isinstance(task, dict):
+            task_id = task.get('id') or task.get('task_id')
+            target_qc = task.get('qc') or task.get('circuit') or task.get('target')
+            length_bin = task.get('length_bin')
+            n_qubits = task.get('n_qubits')
+        elif isinstance(task, (tuple, list)) and len(task) == 2:
+            task_id, target_qc = task
+
+        if target_qc is None:
+            raise ValueError("task_pool 中的任务需包含 QuantumCircuit 实例。")
+        if task_id is None:
+            task_id = f"task_{id(target_qc)}"
+
+        if not isinstance(target_qc, QuantumCircuit):
+            raise TypeError("task_pool 中的目标需为 QuantumCircuit。")
+
+        if n_qubits is None:
+            n_qubits = target_qc.num_qubits
+
+        return str(task_id), target_qc, length_bin, n_qubits
+
+    def _sample_task(self, mode):
+        """从任务池中随机抽取一个任务"""
+        task_list = self.train_tasks if mode == 'train' else self.test_tasks
+        idx = self._np_random.choice(len(task_list))
+        return self._parse_task(task_list[idx])
+
+    def _operation(self, action_id):
+        """将动作ID转换为量子门操作"""
+        if action_id >= len(self.action_mapping):
+            return None
+
+        action = self.action_mapping[action_id]
+        gate_type = action['gate']
+        target = action['target']
+        control = action['control']
+
+        # 单量子比特门
+        if gate_type == 'H':
+            return HGate(), [target]
+        if gate_type == 'X':
+            return XGate(), [target]
+        if gate_type == 'Y':
+            return YGate(), [target]
+        if gate_type == 'Z':
+            return ZGate(), [target]
+        if gate_type == 'T':
+            return TGate(), [target]
+
+        # 双量子比特门
+        if gate_type == 'CNOT':
+            return CXGate(), [control, target]
+
+        return None
+
+    def _compute_fidelity(self):
+        """计算当前电路酉阵与目标电路酉阵的保真度（Hilbert–Schmidt 内积）。"""
+        if self.target_unitary is None:
+            return 0.0
+        U_current = self.qc_operator.data
+        U_target = self.target_unitary
+        if U_current.shape != U_target.shape:
+            raise ValueError(
+            f"Unitary shape mismatch: U_current{U_current.shape} vs U_target{U_target.shape}. "
+            f"可能是 n_qubits 不一致，或 reset 后 action_mapping/qc 未正确重建。" )
+        hs_inner = np.trace(U_current.conj().T @ U_target) / U_target.shape[0]
+        fidelity = float(np.abs(hs_inner) ** 2)
+        return fidelity
+
+    def reward(self, fidelity: float) -> float:
+        """
+        - 若 fidelity >= self.fidelity_threshold(τ)：奖励 = self.success_reward(R)
+        - 否则：奖励 = fidelity - self.fidelity_threshold
+        """
+        tau = float(self.fidelity_threshold)
+        R = float(self.success_reward)
+        F = float(fidelity)
+        return float(R if F >= tau else (F - tau))
+
+    def reward_cost(self, fidelity: float, prev_fidelity: float, current_depth: int) -> float:
+        """
+        成本奖励（cost = 1 - fidelity），以“达到阈值 tau”为目标，深度 max_depth 为预算上限：
+        - 成功：F_t >= tau -> R_succ
+        - 失败：depth >= max_depth 且仍未成功 -> R_fail
+        - 否则：max( (C_prev - C_t) / (C_prev - E_min), -1 )
+        其中 E_min = 1 - tau（以“刚好达标”的cost作为参考下界）
+        """
+        tau = float(self.fidelity_threshold)
+        E_min = 1.0 - tau
+
+        R_succ = float(self.success_reward)
+        R_fail = float(self.fail_reward)
+
+        F_t = float(fidelity)
+        F_prev = float(prev_fidelity)
+
+        # 1) 成功（更直观）
+        if F_t >= tau:
+            return R_succ
+
+        # 2) 失败（预算用深度）
+        if int(current_depth) >= int(self.max_depth):
+            return R_fail
+
+        # 3) 过程奖励：用 cost 改进做归一化
+        C_t = 1.0 - F_t
+        C_prev = 1.0 - F_prev
+
+        denom = (C_prev - E_min)
+        if abs(denom) < 1e-8:   # 比 1e-12 更稳
+            return -1.0
+
+        improvement = (C_prev - C_t) / denom
+        return float(max(improvement, -1.0))
+
+    def _observation(self):
+        """返回定长门序列，未使用的槽位填充为 -1。"""
+        obs = np.full(self.max_gates, -1, dtype=np.int32)
+        if self.gate_tokens:
+            L = min(len(self.gate_tokens), self.max_gates)
+            obs[:L] = np.array(self.gate_tokens[:L], dtype=np.int32)
+        return obs
+
+    def _action_mask(self):
+        """
+        生成动作可行性掩码：1=legal, 0=illegal。
+        基于 frontier（每个 qubit 的最外层触碰门）而不是全局 last_action。
+
+        规则（门集: H,X,Y,Z,T,CNOT）：
+        - max_gates 达到则全 0。
+        - 无历史门则全 1。
+        - cancellation：
+            * 单比特自逆门 {H,X,Y,Z}：同门同 target -> illegal
+            * CNOT：同向同 control/target -> illegal
+        - redundancy（只做 Pauli-Pauli）：
+            * X/Y/Z 两两组合等价于第三个 Pauli（允许全局相位）-> cand illegal
+        - 不处理 1q <-> CNOT 的推门/传播冗余：若 frontier 是 CNOT，则对 1q cand 不做上述 1q 规则（视为屏障）。
+        """
+        action_n = len(self.action_mapping)
+
+        # depth上限
+        if self.current_depth >= self.max_depth:
+            return np.zeros(action_n, dtype=np.int8)
+
+        # 空电路：全部合法
+        if not self.gate_tokens:
+            return np.ones(action_n, dtype=np.int8)
+
+        mask = np.ones(action_n, dtype=np.int8)
+
+        # 配置
+        cancel_1q = {'H', 'X', 'Y', 'Z'}
+
+        pauli_redundant_pairs = {
+            ('X', 'Y'), ('Y', 'X'),
+            ('Y', 'Z'), ('Z', 'Y'),
+            ('Z', 'X'), ('X', 'Z'),
+        }
+
+        def _frontier_act(q):
+            """返回 qubit q 的最外层触碰门 act(dict)，若为空返回 None"""
+            st = self._qubit_stacks[q]
+            if not st:
+                return None
+            return self.action_mapping[int(st[-1])]  # st[-1] 必须是 action_id(int)
+
+        for idx, cand in enumerate(self.action_mapping):
+            g = cand['gate']
+
+            # ========= A) 单比特候选 =========
+            if g in self.single_gates:
+                q = cand['target']
+                prev = _frontier_act(q)
+                if prev is None:
+                    continue  # 该 qubit 还没被触碰过 -> 不触发规则
+
+                # 若 frontier 是 CNOT：按你的设定先不处理 1q<->CNOT 冗余/消除，直接放过
+                if prev['gate'] == 'CNOT':
+                    continue
+
+                prev_gate = prev['gate']
+
+                # 1) cancellation：H/X/Y/Z 同门同 target
+                if g in cancel_1q and prev_gate == g:
+                    mask[idx] = 0
+                    continue
+
+                # 2) redundancy：只处理 Pauli-Pauli (X/Y/Z)
+                # （不看对易，只要两步能落回门集单门就 mask）
+                if (prev_gate, g) in pauli_redundant_pairs:
+                    mask[idx] = 0
+                    continue
+
+                continue
+
+            # ========= B) CNOT 候选 =========
+            if g == 'CNOT':
+                c = cand['control']
+                t = cand['target']
+
+                prev_c = _frontier_act(c)
+                prev_t = _frontier_act(t)
+
+                # cancellation：只有当 control 和 target 两条线的 frontier 都是“同一个 CNOT(action)”
+                # 且方向一致时，cand 才会与其相邻抵消
+                if (prev_c is not None and prev_t is not None and
+                    prev_c is prev_t and
+                    prev_c['gate'] == 'CNOT' and
+                    prev_c['control'] == c and prev_c['target'] == t):
+                    mask[idx] = 0
+                    continue
+
+                continue
+
+            # 其他类型动作（若未来扩展）：默认合法
+            continue
+
+        return mask
+
+    def reset(self, seed=None, options=None, mode='train'):
+        """
+        重置环境：从指定 mode 的任务列表随机抽取任务。
+        重新设置量子比特数、动作映射、空间，以及缓存目标酉矩阵/目标态。
+        同时清空 gate_tokens / qubit_stacks / fidelities 等 episode 状态，避免 mask 被污染。
+        """
+        super().reset(seed=seed)
+
+        # 你采样任务用的是 self._np_random（不是 gym 的 self.np_random），所以这里也要跟着 reseed
+        if seed is not None:
+            self._np_random, _ = gym.utils.seeding.np_random(seed)
+
+        # 采样任务
+        self.current_task_id, self.target_qc, self.current_length_bin, self.n_qubits = self._sample_task(mode)
+
+        # 安全检查：任务 qubits 不应超过 max_qubits
+        if int(self.n_qubits) > int(self.max_qubits):
+            raise ValueError(f"Task n_qubits={self.n_qubits} exceeds env.max_qubits={self.max_qubits}")
+
+        # 重新构建当前电路与缓存
+        self._qc = QuantumCircuit(self.n_qubits)
+        self.qc_operator = Operator(self._qc)          # ✅ 与 _compute_fidelity() 一致
+        self.current_depth = self._qc.depth()
+        self.current_gates = len(self._qc.data)
+
+        # 缓存目标（与你的 fidelity 计算一致）
+        self.target_unitary = Operator(self.target_qc).data   # ✅ 与 _compute_fidelity() 一致
+
+        # episode 状态清空（mask 依赖这些）
+        self.gate_tokens = []
+        self.fidelities = []
+        self._qubit_stacks = [[] for _ in range(self.n_qubits)]  # ✅ frontier 从空开始
+
+
+        obs = self._observation()
+        info = {
+            "fidelity": float(self._compute_fidelity()),
+            "gate_count": 0,
+            "step_count": 0,
+            "depth": int(self.current_depth),
+            "task_id": self.current_task_id,
+            "n_qubits": int(self.n_qubits),
+            "length_bin": self.current_length_bin,
+            "action_mask": self._action_mask(),
+        }
+        return obs, info
+
+    def step(self, action_id):
+        # prev_fidelity
+        if len(self.fidelities) == 0:
+            prev_fidelity = float(self._compute_fidelity())
+            self.fidelities = [prev_fidelity]
+        else:
+            prev_fidelity = float(self.fidelities[-1])
+
+        # mask for current state
+        mask = self._action_mask()
+
+        aid = -1 if action_id is None else int(action_id)
+        illegal = (
+            action_id is None
+            or aid < 0
+            or aid >= len(self.action_mapping)
+            or mask[aid] == 0
+        )
+
+        if not illegal:
+            operation = self._operation(aid)
+            if operation is None:
+                illegal = True
+            else:
+                self._qc.append(*operation)
+                self.gate_tokens.append(aid)
+
+                act = self.action_mapping[aid]
+                g = act['gate']
+                if g in self.single_gates:
+                    q = act['target']
+                    self._qubit_stacks[q].append(aid)
+                elif g == 'CNOT':
+                    c, t = act['control'], act['target']
+                    self._qubit_stacks[c].append(aid)
+                    self._qubit_stacks[t].append(aid)
+
+                self.qc_operator = Operator(self._qc)
+                self.current_depth = self._qc.depth()
+                self.current_gates = len(self._qc.data)
+        else:
+            self.current_depth = self._qc.depth()
+            self.current_gates = len(self._qc.data)
+
+        fidelity = float(self._compute_fidelity())
+
+        reached_fidelity = fidelity >= float(self.fidelity_threshold)
+        reached_max_depth = int(self.current_depth) >= int(self.max_depth)
+        reached_max_gates = len(self.gate_tokens) >= int(self.max_gates)  # ✅ 若你保留 max_gates
+
+        terminated = bool(reached_fidelity)
+        truncated = bool(reached_max_depth or reached_max_gates)          # ✅ 避免死循环
+
+        reward = float(self.reward_cost(
+            fidelity=fidelity,
+            prev_fidelity=prev_fidelity,
+            current_depth=int(self.current_depth)
+        ))
+
+        obs = self._observation()
+
+        info = {
+            "fidelity": fidelity,
+            "step_count": len(self.gate_tokens),
+            "gate_count": len(self._qc.data),
+            "task_id": self.current_task_id,
+            "n_qubits": self.n_qubits,
+            "length_bin": self.current_length_bin,
+            "depth": int(self.current_depth),
+            "action_mask": mask,
+            "reached_max_depth": bool(reached_max_depth),
+            "reached_max_gates": bool(reached_max_gates),
+            "illegal_action": bool(illegal),
+        }
+
+        self.fidelities.append(fidelity)
+        return obs, reward, terminated, truncated, info
+
+# 注册环境
+register(
+    id='CircuitDesigner-Discrete-v1',
+    entry_point='envs.circuit_sys_discrete:CircuitDesignerDiscrete',
+)
+
+
+if __name__ == "__main__":
+
+    def render(self):
+        """渲染电路"""
+        if self.render_mode is None:
+            return None
+        return self._qc.draw(self.render_mode)
+
+    def get_action_info(self, action_id):
+        """获取动作的详细信息（用于调试）"""
+        if action_id < len(self.action_mapping):
+            return self.action_mapping[action_id]
+        return None
+
+
+
