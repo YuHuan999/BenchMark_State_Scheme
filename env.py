@@ -17,7 +17,6 @@ class CircuitDesignerDiscrete(gym.Env):
 
     def __init__(
         self,
-        max_qubits: int,
         max_gates: int,
         max_depth: int,
         task_pool=None,
@@ -25,6 +24,8 @@ class CircuitDesignerDiscrete(gym.Env):
         test_tasks=None,
         seed=None,
         render_mode=None,
+        mode='train',
+        max_qubits = 4,  ## 统一one-hot编码
         fidelity_threshold: float = 0.99,
         success_reward: float = 5.0,
         fail_reward: float = -5.0,
@@ -41,6 +42,7 @@ class CircuitDesignerDiscrete(gym.Env):
             raise ValueError("任务列表不能为空。")
 
         self.render_mode = render_mode
+        self.mode = mode
         self.name = f"REBUILD|{max_qubits}-g{max_depth}"
 
         self.max_qubits = max_qubits
@@ -75,18 +77,18 @@ class CircuitDesignerDiscrete(gym.Env):
         self.two_gates = ['CNOT']  # 双量子比特门
 
         # 离散动作空间：为每种可能的门-量子比特组合分配一个动作ID
-        self.action_mapping = self._create_action_mapping()
-        self.action_space = gym.spaces.Discrete(len(self.action_mapping))
+        self.actions = self._create_action_mapping()
+        self.action_space = gym.spaces.Discrete(len(self.actions))
 
         # 观察空间：定长门序列，padding=-1
         self.observation_space = gym.spaces.Box(
             low=-1,
-            high=len(self.action_mapping) - 1,
+            high=len(self.actions) - 1,
             shape=(self.max_gates,),
             dtype=np.int32,
         )
 
-        print(f"Created {len(self.action_mapping)} discrete actions")
+        print(f"Created {len(self.actions)} discrete actions")
 
     def _create_action_mapping(self):
         """创建动作ID到(门类型, 量子比特)的映射"""
@@ -120,17 +122,16 @@ class CircuitDesignerDiscrete(gym.Env):
         return u1, u2
 
     def _parse_task(self, task):
-        """解析任务条目，返回 (task_id, target_qc, length_bin, n_qubits)。"""
+        """解析任务条目，返回 (task_id, target_qc, length_bin)。"""
         task_id = None
         target_qc = None
         length_bin = None
-        n_qubits = None
+
 
         if isinstance(task, dict):
             task_id = task.get('id') or task.get('task_id')
             target_qc = task.get('qc') or task.get('circuit') or task.get('target')
             length_bin = task.get('length_bin')
-            n_qubits = task.get('n_qubits')
         elif isinstance(task, (tuple, list)) and len(task) == 2:
             task_id, target_qc = task
 
@@ -142,23 +143,20 @@ class CircuitDesignerDiscrete(gym.Env):
         if not isinstance(target_qc, QuantumCircuit):
             raise TypeError("task_pool 中的目标需为 QuantumCircuit。")
 
-        if n_qubits is None:
-            n_qubits = target_qc.num_qubits
+        return str(task_id), target_qc, length_bin
 
-        return str(task_id), target_qc, length_bin, n_qubits
-
-    def _sample_task(self, mode):
+    def _sample_task(self):
         """从任务池中随机抽取一个任务"""
-        task_list = self.train_tasks if mode == 'train' else self.test_tasks
+        task_list = self.train_tasks if self.mode == 'train' else self.test_tasks
         idx = self._np_random.choice(len(task_list))
         return self._parse_task(task_list[idx])
 
     def _operation(self, action_id):
         """将动作ID转换为量子门操作"""
-        if action_id >= len(self.action_mapping):
+        if action_id >= len(self.actions):
             return None
 
-        action = self.action_mapping[action_id]
+        action = self.actions[action_id]
         gate_type = action['gate']
         target = action['target']
         control = action['control']
@@ -190,7 +188,7 @@ class CircuitDesignerDiscrete(gym.Env):
         if U_current.shape != U_target.shape:
             raise ValueError(
             f"Unitary shape mismatch: U_current{U_current.shape} vs U_target{U_target.shape}. "
-            f"可能是 n_qubits 不一致，或 reset 后 action_mapping/qc 未正确重建。" )
+            f"可能是 n_qubits 不一致，或 reset 后 actions/qc 未正确重建。" )
         hs_inner = np.trace(U_current.conj().T @ U_target) / U_target.shape[0]
         fidelity = float(np.abs(hs_inner) ** 2)
         return fidelity
@@ -205,7 +203,10 @@ class CircuitDesignerDiscrete(gym.Env):
         F = float(fidelity)
         return float(R if F >= tau else (F - tau))
 
-    def reward_cost(self, fidelity: float, prev_fidelity: float, current_depth: int) -> float:
+    def reward_cost(self, fidelity: float, 
+                    prev_fidelity: float, 
+                    current_depth: int, 
+                    current_gates: int) -> float:
         """
         成本奖励（cost = 1 - fidelity），以“达到阈值 tau”为目标，深度 max_depth 为预算上限：
         - 成功：F_t >= tau -> R_succ
@@ -226,8 +227,12 @@ class CircuitDesignerDiscrete(gym.Env):
         if F_t >= tau:
             return R_succ
 
-        # 2) 失败（预算用深度）
-        if int(current_depth) >= int(self.max_depth):
+        # # 2) 失败（预算用深度）
+        # if int(current_depth) >= int(self.max_depth):
+        #     return R_fail
+
+        # 2) 失败（预算用门数）
+        if int(current_gates) >= int(self.max_gates):
             return R_fail
 
         # 3) 过程奖励：用 cost 改进做归一化
@@ -264,10 +269,14 @@ class CircuitDesignerDiscrete(gym.Env):
             * X/Y/Z 两两组合等价于第三个 Pauli（允许全局相位）-> cand illegal
         - 不处理 1q <-> CNOT 的推门/传播冗余：若 frontier 是 CNOT，则对 1q cand 不做上述 1q 规则（视为屏障）。
         """
-        action_n = len(self.action_mapping)
+        action_n = len(self.actions)
 
-        # depth上限
-        if self.current_depth >= self.max_depth:
+        # # depth上限
+        # if self.current_depth >= self.max_depth:
+        #     return np.zeros(action_n, dtype=np.int8)
+
+        # gates上限
+        if self.current_gates >= self.max_gates:
             return np.zeros(action_n, dtype=np.int8)
 
         # 空电路：全部合法
@@ -290,9 +299,9 @@ class CircuitDesignerDiscrete(gym.Env):
             st = self._qubit_stacks[q]
             if not st:
                 return None
-            return self.action_mapping[int(st[-1])]  # st[-1] 必须是 action_id(int)
+            return self.actions[int(st[-1])]  # st[-1] 必须是 action_id(int)
 
-        for idx, cand in enumerate(self.action_mapping):
+        for idx, cand in enumerate(self.actions):
             g = cand['gate']
 
             # ========= A) 单比特候选 =========
@@ -345,7 +354,7 @@ class CircuitDesignerDiscrete(gym.Env):
 
         return mask
 
-    def reset(self, seed=None, options=None, mode='train'):
+    def reset(self, seed=None, options=None):
         """
         重置环境：从指定 mode 的任务列表随机抽取任务。
         重新设置量子比特数、动作映射、空间，以及缓存目标酉矩阵/目标态。
@@ -358,11 +367,17 @@ class CircuitDesignerDiscrete(gym.Env):
             self._np_random, _ = gym.utils.seeding.np_random(seed)
 
         # 采样任务
-        self.current_task_id, self.target_qc, self.current_length_bin, self.n_qubits = self._sample_task(mode)
+        self.current_task_id, self.target_qc, self.current_length_bin = self._sample_task()
+        # ---- Route A: enforce fixed qubits ----
+        task_nq = int(self.target_qc.num_qubits)
+        env_nq = int(self.max_qubits)  # 也就是 init 传进来的 max_qubits
+        if task_nq != env_nq:
+            raise ValueError(
+                f"[QUBITS MISMATCH] task has {task_nq} qubits, but env.max_qubits={env_nq}. "
+                f"Fix by generating tasks with the same qubit count or by creating a separate env per qubit count."
+            )
+        # --------------------------------------
 
-        # 安全检查：任务 qubits 不应超过 max_qubits
-        if int(self.n_qubits) > int(self.max_qubits):
-            raise ValueError(f"Task n_qubits={self.n_qubits} exceeds env.max_qubits={self.max_qubits}")
 
         # 重新构建当前电路与缓存
         self._qc = QuantumCircuit(self.n_qubits)
@@ -382,9 +397,9 @@ class CircuitDesignerDiscrete(gym.Env):
         obs = self._observation()
         info = {
             "fidelity": float(self._compute_fidelity()),
-            "gate_count": 0,
-            "step_count": 0,
-            "depth": int(self.current_depth),
+            "gate_count": self.current_gates,
+            "step_count": len(self.gate_tokens),
+            "depth": self.current_depth,
             "task_id": self.current_task_id,
             "n_qubits": int(self.n_qubits),
             "length_bin": self.current_length_bin,
@@ -407,7 +422,7 @@ class CircuitDesignerDiscrete(gym.Env):
         illegal = (
             action_id is None
             or aid < 0
-            or aid >= len(self.action_mapping)
+            or aid >= len(self.actions)
             or mask[aid] == 0
         )
 
@@ -419,7 +434,7 @@ class CircuitDesignerDiscrete(gym.Env):
                 self._qc.append(*operation)
                 self.gate_tokens.append(aid)
 
-                act = self.action_mapping[aid]
+                act = self.actions[aid]
                 g = act['gate']
                 if g in self.single_gates:
                     q = act['target']
@@ -440,34 +455,41 @@ class CircuitDesignerDiscrete(gym.Env):
 
         reached_fidelity = fidelity >= float(self.fidelity_threshold)
         reached_max_depth = int(self.current_depth) >= int(self.max_depth)
-        reached_max_gates = len(self.gate_tokens) >= int(self.max_gates)  # ✅ 若你保留 max_gates
+        reached_max_gates = int(self.current_gates) >= int(self.max_gates)  # ✅ 若你保留 max_gates
 
         terminated = bool(reached_fidelity)
-        truncated = bool(reached_max_depth or reached_max_gates)          # ✅ 避免死循环
+        # truncated = bool(reached_max_depth)          # ✅ 避免死循环
+        truncated = bool((not terminated) and reached_max_gates)
 
         reward = float(self.reward_cost(
             fidelity=fidelity,
             prev_fidelity=prev_fidelity,
-            current_depth=int(self.current_depth)
+            current_depth=int(self.current_depth),
+            current_gates=int(self.current_gates)
         ))
 
         obs = self._observation()
-
+        mask_next = self._action_mask()
         info = {
             "fidelity": fidelity,
             "step_count": len(self.gate_tokens),
-            "gate_count": len(self._qc.data),
+            "gate_count": int(self.current_gates),
             "task_id": self.current_task_id,
             "n_qubits": self.n_qubits,
             "length_bin": self.current_length_bin,
             "depth": int(self.current_depth),
-            "action_mask": mask,
+            "action_mask": mask_next,
             "reached_max_depth": bool(reached_max_depth),
             "reached_max_gates": bool(reached_max_gates),
             "illegal_action": bool(illegal),
         }
 
         self.fidelities.append(fidelity)
+        
+        # 调试模式：检查 gate_tokens 与 qc.data 长度一致
+        if getattr(self, "debug", False):
+            assert len(self.gate_tokens) == len(self._qc.data), "gate_tokens 与 qc.data 长度不一致"
+
         return obs, reward, terminated, truncated, info
 
 # 注册环境
@@ -487,8 +509,8 @@ if __name__ == "__main__":
 
     def get_action_info(self, action_id):
         """获取动作的详细信息（用于调试）"""
-        if action_id < len(self.action_mapping):
-            return self.action_mapping[action_id]
+        if action_id < len(self.actions):
+            return self.actions[action_id]
         return None
 
 
