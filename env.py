@@ -18,7 +18,6 @@ class CircuitDesignerDiscrete(gym.Env):
 
     def __init__(
         self,
-        max_gates: int,
         max_depth: int,
         task_pool=None,
         train_tasks=None,
@@ -26,10 +25,12 @@ class CircuitDesignerDiscrete(gym.Env):
         seed=None,
         render_mode=None,
         mode='train',
-        max_qubits = 4,  ## 统一one-hot编码
+        max_qubits=4,   # 统一 one-hot 编码
+        max_gates=78,   # 统一神经网络输入维度
         fidelity_threshold: float = 0.99,
-        success_reward: float = 5.0,
+        success_reward: float = 6.0,
         fail_reward: float = -5.0,
+        gates_penalty: float = 1.0,
     ):
         super().__init__()
         self._np_random, _ = gym.utils.seeding.np_random(seed)
@@ -48,19 +49,22 @@ class CircuitDesignerDiscrete(gym.Env):
 
         self.max_qubits = max_qubits
         self.n_qubits = max_qubits
-        self.max_gates = max_gates  ## max_gates <= max_depth * n_qubits
+        self.max_gates = max_gates ## max_gates <= max_depth * n_qubits
         self.max_depth = max_depth
         self.fidelity_threshold = fidelity_threshold
         self.success_reward = success_reward
         self.fail_reward = fail_reward
+        self.gates_penalty = gates_penalty
         
 
         self._qc = QuantumCircuit(self.n_qubits)
         self.qc_operator = Operator(self._qc) 
         self.current_depth = self._qc.depth()
         self.current_gates = len(self._qc.data)
+        self.task_budget = 0 ## 实际在训练中可查入门的上限
         self.target_qc = None
         self.target_unitary = None
+        self.gates_target = 0
         self.current_task_id = None
         self.current_length_bin = None ## 当前任务的“长度分箱/难度档位”标签
         self.gate_tokens = []
@@ -123,19 +127,31 @@ class CircuitDesignerDiscrete(gym.Env):
         return u1, u2
 
     def _parse_task(self, task):
+
+        active = task["n_qubits"]
+        for inst, qargs, cargs in task["qc"].data:
+            for q in qargs:
+                if q._index >= active:   # qiskit qubit index
+                    raise ValueError(f"Found op on idle qubit {q._index} for active={active}, task={task['task_id']}")
+                
+        assert task["qc"].num_qubits == 4, f"target qc should be 4-qubit, got {task['qc'].num_qubits}"
+        assert 2 <= task["n_qubits"] <= 4
+        
         """解析任务条目，返回 (task_id, target_qc, length_bin)。"""
         task_id = None
         target_qc = None
         length_bin = None
+        gates_count = None
 
 
         if isinstance(task, dict):
             task_id = task.get('id') or task.get('task_id')
             target_qc = task.get('qc') or task.get('circuit') or task.get('target')
             length_bin = task.get('length_bin')
+            gates_count = len(target_qc.data)
         elif isinstance(task, (tuple, list)) and len(task) == 2:
             task_id, target_qc = task
-
+            gates_count = len(target_qc.data)
         if target_qc is None:
             raise ValueError("task_pool 中的任务需包含 QuantumCircuit 实例。")
         if task_id is None:
@@ -144,7 +160,7 @@ class CircuitDesignerDiscrete(gym.Env):
         if not isinstance(target_qc, QuantumCircuit):
             raise TypeError("task_pool 中的目标需为 QuantumCircuit。")
 
-        return str(task_id), target_qc, length_bin
+        return str(task_id), target_qc, length_bin, gates_count
 
     def _sample_task(self):
         """从任务池中随机抽取一个任务"""
@@ -217,35 +233,33 @@ class CircuitDesignerDiscrete(gym.Env):
         """
         tau = float(self.fidelity_threshold)
         E_min = 1.0 - tau
-
-        R_succ = float(self.success_reward)
-        R_fail = float(self.fail_reward)
-
+        R_succ = float(self.success_reward) ## 6.0
+        R_fail = float(self.fail_reward)  ## -5.0
+        lam_len = float(self.gates_penalty) ## 1.0
         F_t = float(fidelity)
         F_prev = float(prev_fidelity)
+        
+        target_gates = len(self.target_qc.data)
 
         # 1) 成功（更直观）
         if F_t >= tau:
-            return R_succ
-
+            current_gates = self.current_gates
+            return R_succ - (current_gates / target_gates) * lam_len
         # # 2) 失败（预算用深度）
         # if int(current_depth) >= int(self.max_depth):
         #     return R_fail
-
         # 2) 失败（预算用门数）
-        if int(current_gates) >= int(self.max_gates):
+        if int(current_gates) >= int(self.task_budget):
             return R_fail
-
         # 3) 过程奖励：用 cost 改进做归一化
         C_t = 1.0 - F_t
         C_prev = 1.0 - F_prev
-
         denom = (C_prev - E_min)
         if abs(denom) < 1e-8:   # 比 1e-12 更稳
             return -1.0
-
         improvement = (C_prev - C_t) / denom
-        return float(max(improvement, -1.0))
+        improvement = max(min(improvement, 1.0), -1.0) # 归一化到[-1, 1]
+        return float(improvement)
 
     def _observation(self):
         """返回定长门序列，未使用的槽位填充为 -1。"""
@@ -277,7 +291,7 @@ class CircuitDesignerDiscrete(gym.Env):
         #     return np.zeros(action_n, dtype=np.int8)
 
         # gates上限
-        if self.current_gates >= self.max_gates:
+        if self.current_gates >= self.task_budget:
             return np.zeros(action_n, dtype=np.int8)
 
         # 空电路：全部合法
@@ -368,7 +382,8 @@ class CircuitDesignerDiscrete(gym.Env):
             self._np_random, _ = gym.utils.seeding.np_random(seed)
 
         # 采样任务
-        self.current_task_id, self.target_qc, self.current_length_bin = self._sample_task()
+        self.current_task_id, self.target_qc, self.current_length_bin, self.gates_target = self._sample_task()
+        self.task_budget = int(self.gates_target * 1.3)
         # ---- Route A: enforce fixed qubits ----
         task_nq = int(self.target_qc.num_qubits)
         env_nq = int(self.max_qubits)  # 也就是 init 传进来的 max_qubits
@@ -456,11 +471,11 @@ class CircuitDesignerDiscrete(gym.Env):
 
         reached_fidelity = fidelity >= float(self.fidelity_threshold)
         reached_max_depth = int(self.current_depth) >= int(self.max_depth)
-        reached_max_gates = int(self.current_gates) >= int(self.max_gates)  # ✅ 若你保留 max_gates
+        reached_budget = int(self.current_gates) >= int(self.task_budget)  # ✅ 若你保留 max_gates
 
         terminated = bool(reached_fidelity)
         # truncated = bool(reached_max_depth)          # ✅ 避免死循环
-        truncated = bool((not terminated) and reached_max_gates)
+        truncated = bool((not terminated) and reached_budget)
 
         reward = float(self.reward_cost(
             fidelity=fidelity,
@@ -481,7 +496,7 @@ class CircuitDesignerDiscrete(gym.Env):
             "depth": int(self.current_depth),
             "action_mask": mask_next,
             "reached_max_depth": bool(reached_max_depth),
-            "reached_max_gates": bool(reached_max_gates),
+            "reached_budget": bool(reached_budget),
             "illegal_action": bool(illegal),
         }
 
@@ -493,26 +508,20 @@ class CircuitDesignerDiscrete(gym.Env):
 
         return obs, reward, terminated, truncated, info
 
-# 注册环境
-register(
-    id='CircuitDesigner-Discrete-v1',
-    entry_point='envs.circuit_sys_discrete:CircuitDesignerDiscrete',
-)
-
-
-if __name__ == "__main__":
-
     def render(self):
-        """渲染电路"""
+        """渲染当前电路"""
         if self.render_mode is None:
             return None
         return self._qc.draw(self.render_mode)
 
     def get_action_info(self, action_id):
-        """获取动作的详细信息（用于调试）"""
-        if action_id < len(self.actions):
-            return self.actions[action_id]
+        """调试：返回动作对应的门及作用量子比特"""
+        if 0 <= int(action_id) < len(self.actions):
+            return self.actions[int(action_id)]
         return None
 
-
-
+# 注册环境
+register(
+    id='CircuitDesigner-Discrete-v1',
+    entry_point='env:CircuitDesignerDiscrete',
+)
