@@ -1,33 +1,29 @@
 import numpy as np
 from qiskit import QuantumCircuit
-
+import math
+import numpy as np
 # ---------------------
-# Defaults for length and depth bins
+# Defaults for score bins
 # ---------------------
-DEFAULT_LENGTH_BINS = {
-    "short": (4, 8),
-    "medium": (9, 16),
-    "long": (17, 24),
-    "xlong": (25, 40),
-    "xxlong": (41, 60),
-}
+DEFAULT_SCORE_BINS = {
+    "easy": (48, 422),
+    "medium": (423, 797),
+    "hard": (798, 1172),
+    "very_hard": (1173, 1546),
+    "extreme": (1547, 1920),
+} ## score = length * action space
 
 # 默认让更长的任务占比低一些（总计 30%）
-DEFAULT_LENGTH_BIN_PROBS = {
-    "short": 0.25,
+DEFAULT_SCORE_BIN_PROBS = {
+    "easy": 0.25,
     "medium": 0.25,
-    "long": 0.20,
-    "xlong": 0.20,
-    "xxlong": 0.10,
+    "hard": 0.20,
+    "very_hard": 0.20,
+    "extreme": 0.10,
 }
-
-# 你可以自己改成你想要的深度档位（层数）
-DEFAULT_DEPTH_BINS = {
-    "shallow": (3, 6),
-    "mid": (7, 12),
-    "deep": (13, 20),
-}
-
+DEFAULT_LENGTH_BINS = {}
+DEFAULT_DEPTH_BINS = {}
+DEFAULT_LENGTH_BIN_PROBS = {}
 # ---------------------
 # Gate set (match env)
 # ---------------------
@@ -39,6 +35,123 @@ PAULI_REDUNDANT_PAIRS = {
     ("Z", "X"), ("X", "Z"),
 }
 
+def action_space_size(n_qubits: int) -> int:
+    return len(_all_actions(int(n_qubits)))
+
+def difficulty_score(n_qubits: int, gate_count: int) -> int:
+    return int(action_space_size(n_qubits) * int(gate_count))
+
+def _alloc_counts(total: int, probs: dict, keys: list[str]) -> dict[str, int]:
+    """按 probs 分配整数个数，保证总和=total（最大余数法）"""
+    p = np.array([float(probs[k]) for k in keys], dtype=float)
+    p = p / p.sum()
+    raw = p * int(total)
+    base = np.floor(raw).astype(int)
+    rest = int(total) - int(base.sum())
+    if rest > 0:
+        frac = raw - base
+        order = np.argsort(-frac)
+        for i in range(rest):
+            base[order[i]] += 1
+    return {k: int(v) for k, v in zip(keys, base)}
+
+def build_equal_width_score_bins(
+    n_qubits_choices=(2, 3, 4),
+    min_gates: int = 4,
+    max_gates: int = 60,
+    labels=("easy", "medium", "hard", "very_hard", "extreme"),
+):
+    """
+    自动构造 score bins：把 [score_min, score_max] 等宽切成 5 段。
+    score_min = min(|A(n)|*min_gates), score_max = max(|A(n)|*max_gates)
+    """
+    s_min = min(action_space_size(n) * min_gates for n in n_qubits_choices)
+    s_max = max(action_space_size(n) * max_gates for n in n_qubits_choices)
+
+    total = s_max - s_min + 1
+    k = len(labels)
+    base = total // k
+    rem = total % k
+
+    bins = {}
+    lo = s_min
+    for i, name in enumerate(labels):
+        width = base + (1 if i < rem else 0)
+        hi = lo + width - 1
+        bins[name] = (int(lo), int(hi))   # 闭区间
+        lo = hi + 1
+    return bins
+
+def generate_tasks_by_score_distribution(
+    seed: int,
+    n_tasks: int,
+    n_qubits_choices=(2, 3, 4),
+    probs=None,
+    score_bins=None,
+    min_gates: int = 4,
+    max_gates: int = 60,
+    max_tries: int = 200,
+):
+    """
+    只做一件事：按给定 probs（5档）生成 n_tasks 个目标电路任务，直接返回 tasks(list[dict])。
+    不包含 action mask 过滤（纯随机目标电路）。
+    """
+    rng = np.random.default_rng(int(seed))
+    probs = probs or DEFAULT_SCORE_BIN_PROBS
+    labels = list(probs.keys())
+
+    # 若用户没给 score_bins，则按 [min,max] 等宽自动切 5 档
+    score_bins = score_bins or build_equal_width_score_bins(
+        n_qubits_choices=n_qubits_choices,
+        min_gates=min_gates,
+        max_gates=max_gates,
+        labels=tuple(labels),
+    )
+
+    counts = _alloc_counts(int(n_tasks), probs, labels)
+
+    tasks = []
+    idx = 0
+    for b in labels:
+        s_lo, s_hi = score_bins[b]
+        for _ in range(counts[b]):
+
+            ok = False
+            for __ in range(max_tries):
+                n = int(rng.choice(n_qubits_choices))
+                A = action_space_size(n)
+
+                # 推导 gate_count 可行区间，使得 s_lo <= A*L <= s_hi
+                L_lo = max(min_gates, int(math.ceil(s_lo / A)))
+                L_hi = min(max_gates, int(math.floor(s_hi / A)))
+                if L_lo > L_hi:
+                    continue
+
+                gate_count = int(rng.integers(L_lo, L_hi + 1))
+                qc = build_random_circuit_totally(n, gate_count, rng)
+
+                L = gate_count
+                sc = difficulty_score(n, L)
+
+                if (min_gates <= L <= max_gates) and (s_lo <= sc <= s_hi):
+                    tasks.append({
+                        "task_id": f"task_{idx}",
+                        "qc": qc,
+                        "n_qubits": n,
+                        "difficulty_bin": b,   # 建议用新字段名，避免和 length_bin 混淆
+                        "target_gates": L,
+                        "difficulty_score": sc,
+                    })
+                    idx += 1
+                    ok = True
+                    break
+
+            if not ok:
+                raise RuntimeError(f"Failed to sample task in bin={b}. "
+                                   f"Try increasing max_tries or adjusting score_bins.")
+
+    rng.shuffle(tasks)
+    return tasks, score_bins
 
 def _all_actions(n_qubits: int):
     """
@@ -56,84 +169,6 @@ def _all_actions(n_qubits: int):
                 if c != t:
                     actions.append({"gate": "CNOT", "control": c, "target": t})
     return actions
-
-
-def _frontier_mask_is_legal(cand, qubit_stacks, op_table, n_qubits):
-    """
-    复刻你环境的 frontier-based mask 规则（只用到你目前的简化版）：
-    - 1q cancellation: {H,X,Y,Z} 同门相邻
-    - 1q redundancy: Pauli-Pauli (X/Y/Z) 两两组合冗余
-    - CNOT cancellation: 同向相邻抵消（两条线 frontier 指向同一个 CNOT）
-    - frontier 是 CNOT 时：1q 不触发 1q 规则（当作屏障）
-    """
-    def frontier_act(q):
-        st = qubit_stacks[q]
-        if not st:
-            return None, None
-        op_id = st[-1]
-        return op_id, op_table[op_id]
-
-    g = cand["gate"]
-
-    # ===== A) 1q candidate =====
-    if g in SINGLE_GATES:
-        q = cand["target"]
-        prev_id, prev = frontier_act(q)
-        if prev is None:
-            return True
-
-        # frontier is CNOT: treat as barrier for 1q rules
-        if prev["gate"] == "CNOT":
-            return True
-
-        prev_g = prev["gate"]
-
-        # cancellation
-        if g in CANCEL_1Q and prev_g == g:
-            return False
-
-        # redundancy (Pauli-Pauli)
-        if (prev_g, g) in PAULI_REDUNDANT_PAIRS:
-            return False
-
-        return True
-
-    # ===== B) CNOT candidate =====
-    if g == "CNOT":
-        c, t = cand["control"], cand["target"]
-        pc_id, pc = frontier_act(c)
-        pt_id, pt = frontier_act(t)
-
-        # adjacent cancellation requires both frontiers point to same op_id
-        if (pc is not None and pt is not None and pc_id == pt_id and
-            pc["gate"] == "CNOT" and pc["control"] == c and pc["target"] == t):
-            return False
-
-        return True
-
-    return True
-
-
-def _depth_after_append(act, layers):
-    """
-    用“ASAP layering”方式增量维护 depth（层数）。
-    Qiskit 的 qc.depth() 对于这种顺序 append 的 DAG depth，本质就是最长依赖路径，
-    这套 layers 更新可以非常稳定地等价（且比每步 qc.depth() 快得多）。
-    """
-    g = act["gate"]
-    if g in SINGLE_GATES:
-        q = act["target"]
-        new_layer = layers[q] + 1
-        new_max = max(max(layers), new_layer)
-        return new_layer, None, new_max
-    elif g == "CNOT":
-        c, t = act["control"], act["target"]
-        base = max(layers[c], layers[t]) + 1
-        new_max = max(max(layers), base)
-        return base, base, new_max
-    else:
-        return None, None, max(layers)
-
 
 def _apply_to_qiskit(qc: QuantumCircuit, act: dict):
     """把动作真正 append 到 Qiskit 电路里。"""
@@ -153,370 +188,474 @@ def _apply_to_qiskit(qc: QuantumCircuit, act: dict):
     else:
         raise ValueError(f"Unknown gate: {g}")
 
-
-def _build_random_circuit_by_gates(n_qubits: int, gate_count: int, rng: np.random.Generator):
+def build_random_circuit_totally(n_qubits: int, gate_count: int, rng: np.random.Generator):
     """
-    按门数生成：每一步只从“合法动作”中采样（遵守你的 action mask 规则）。
+    完全随机按门数生成：
+    - 不执行 action mask / frontier 规则
+    - 每一步从全动作集合 _all_actions(n_qubits) 中等概率采样一个动作
+    - qc 固定为 QuantumCircuit(4)（与你环境匹配）
     """
-    # qc = QuantumCircuit(n_qubits)
-    qc = QuantumCircuit(4)
-    action_mapping = _all_actions(n_qubits)
+    if gate_count < 0:
+        raise ValueError("gate_count must be >= 0")
+    if n_qubits <= 0 or n_qubits > 4:
+        raise ValueError("n_qubits must be in [1, 4] since qc is fixed to 4 qubits")
 
-    op_table = []  # op_id -> act(dict)
-    qubit_stacks = [[] for _ in range(n_qubits)]
+    qc = QuantumCircuit(4)  # 保持你要求：与环境匹配的固定4比特电路
+    action_mapping = _all_actions(n_qubits)  # 只枚举前 n_qubits 的动作
 
+    # 直接均匀随机采样 gate_count 次
     for _ in range(gate_count):
-        legal_ids = [
-            i for i, a in enumerate(action_mapping)
-            if _frontier_mask_is_legal(a, qubit_stacks, op_table, n_qubits)
-        ]
-        if not legal_ids:
-            raise RuntimeError("No legal actions available (gate mode).")
-
-        aid = int(rng.choice(legal_ids))
-        act = action_mapping[aid]
-
-        # apply
+        act = action_mapping[int(rng.integers(0, len(action_mapping)))]
         _apply_to_qiskit(qc, act)
-
-        # update frontier table
-        op_id = len(op_table)
-        if act["gate"] == "CNOT":
-            op_table.append({"gate": "CNOT", "control": act["control"], "target": act["target"]})
-            qubit_stacks[act["control"]].append(op_id)
-            qubit_stacks[act["target"]].append(op_id)
-        else:
-            op_table.append({"gate": act["gate"], "target": act["target"], "control": None})
-            qubit_stacks[act["target"]].append(op_id)
 
     return qc
 
 
-def _build_random_circuit_by_depth(n_qubits: int, target_depth: int, rng: np.random.Generator,
-                                   max_steps: int = 20000):
-    """
-    按深度（层数）生成：不断采样合法动作，但额外约束“新增后 depth 不能超过 target_depth”。
-    一旦达到 target_depth 就停止（电路深度恰好等于 target_depth）。
-    """
-    if target_depth <= 0:
-        # return QuantumCircuit(n_qubits)
-        return QuantumCircuit(4)
 
-    # qc = QuantumCircuit(n_qubits)
-    qc = QuantumCircuit(4)
-    action_mapping = _all_actions(n_qubits)
+## 备用含action mask，基于深度生成量子电路的代码
+# def _frontier_mask_is_legal(cand, qubit_stacks, op_table, n_qubits):
+#     """
+#     复刻你环境的 frontier-based mask 规则（只用到你目前的简化版）：
+#     - 1q cancellation: {H,X,Y,Z} 同门相邻
+#     - 1q redundancy: Pauli-Pauli (X/Y/Z) 两两组合冗余
+#     - CNOT cancellation: 同向相邻抵消（两条线 frontier 指向同一个 CNOT）
+#     - frontier 是 CNOT 时：1q 不触发 1q 规则（当作屏障）
+#     """
+#     def frontier_act(q):
+#         st = qubit_stacks[q]
+#         if not st:
+#             return None, None
+#         op_id = st[-1]
+#         return op_id, op_table[op_id]
 
-    op_table = []
-    qubit_stacks = [[] for _ in range(n_qubits)]
+#     g = cand["gate"]
 
-    # layers[q] 表示该 qubit 当前最外层所在的层号（从 0 开始计数）
-    layers = [0] * n_qubits
-    current_depth = 0
+#     # ===== A) 1q candidate =====
+#     if g in SINGLE_GATES:
+#         q = cand["target"]
+#         prev_id, prev = frontier_act(q)
+#         if prev is None:
+#             return True
 
-    # 我们需要达到 target_depth（层数），这里把“层数”定义为 max(layers)
-    # 初始没有门 depth=0；加一个门后 depth 至少变成 1
-    steps = 0
-    while current_depth < target_depth:
-        steps += 1
-        if steps > max_steps:
-            # 理论上很少；如果你把 mask 规则再加严可能会触发
-            raise RuntimeError("Depth sampling stuck. Increase max_steps or loosen constraints.")
+#         # frontier is CNOT: treat as barrier for 1q rules
+#         if prev["gate"] == "CNOT":
+#             return True
 
-        feasible_ids = []
-        for i, a in enumerate(action_mapping):
-            # 先过 mask
-            if not _frontier_mask_is_legal(a, qubit_stacks, op_table, n_qubits):
-                continue
+#         prev_g = prev["gate"]
 
-            # 再过 depth 预算：新增后不能超过 target_depth
-            if a["gate"] in SINGLE_GATES:
-                q = a["target"]
-                new_layer = layers[q] + 1
-                new_depth = max(current_depth, new_layer)
-                if new_depth <= target_depth:
-                    feasible_ids.append(i)
-            elif a["gate"] == "CNOT":
-                c, t = a["control"], a["target"]
-                base = max(layers[c], layers[t]) + 1
-                new_depth = max(current_depth, base)
-                if new_depth <= target_depth:
-                    feasible_ids.append(i)
+#         # cancellation
+#         if g in CANCEL_1Q and prev_g == g:
+#             return False
 
-        if not feasible_ids:
-            # 这说明在当前状态下无法继续扩展到目标深度（极少见）
-            # 最简单的处理：重来一次（rejection）
-            return _build_random_circuit_by_depth(n_qubits, target_depth, rng, max_steps=max_steps)
+#         # redundancy (Pauli-Pauli)
+#         if (prev_g, g) in PAULI_REDUNDANT_PAIRS:
+#             return False
 
-        aid = int(rng.choice(feasible_ids))
-        act = action_mapping[aid]
+#         return True
 
-        # apply
-        _apply_to_qiskit(qc, act)
+#     # ===== B) CNOT candidate =====
+#     if g == "CNOT":
+#         c, t = cand["control"], cand["target"]
+#         pc_id, pc = frontier_act(c)
+#         pt_id, pt = frontier_act(t)
 
-        # update depth layers
-        if act["gate"] in SINGLE_GATES:
-            q = act["target"]
-            layers[q] = layers[q] + 1
-            current_depth = max(current_depth, layers[q])
-        else:
-            c, t = act["control"], act["target"]
-            base = max(layers[c], layers[t]) + 1
-            layers[c] = base
-            layers[t] = base
-            current_depth = max(current_depth, base)
+#         # adjacent cancellation requires both frontiers point to same op_id
+#         if (pc is not None and pt is not None and pc_id == pt_id and
+#             pc["gate"] == "CNOT" and pc["control"] == c and pc["target"] == t):
+#             return False
 
-        # update frontier
-        op_id = len(op_table)
-        if act["gate"] == "CNOT":
-            op_table.append({"gate": "CNOT", "control": act["control"], "target": act["target"]})
-            qubit_stacks[act["control"]].append(op_id)
-            qubit_stacks[act["target"]].append(op_id)
-        else:
-            op_table.append({"gate": act["gate"], "target": act["target"], "control": None})
-            qubit_stacks[act["target"]].append(op_id)
+#         return True
 
-    return qc
+#     return True
 
 
-def generate_task_suite(
-    seed,
-    n_tasks=60,
-    n_qubits_choices=(2, 3, 4),
-    length_bins=None,
-    depth_bins=None,
-    length_bin_probs=None,
-    mode="gates",  # "gates" 或 "depth"
-):
-    """
-    生成随机任务集，每个任务包含目标电路。
-
-    mode="gates": 使用 length_bins 采样 gate_count，生成 gate_count 个门
-    mode="depth": 使用 depth_bins 采样 target_depth，生成深度恰好为 target_depth 的电路
-
-    返回: (train_tasks, test_tasks)，切分比例 70% / 30%。
-    """
-    rng = np.random.default_rng(seed)
-
-    bins_g = length_bins or DEFAULT_LENGTH_BINS
-    bins_d = depth_bins or DEFAULT_DEPTH_BINS
-
-    tasks = []
-    for idx in range(n_tasks):
-        n_qubits = int(rng.choice(n_qubits_choices))
-
-        if mode == "gates":
-            bin_names = list(bins_g.keys())
-            # 如果你用默认 length_bins（为 None），就采用默认分布；否则默认均匀采样
-            if length_bin_probs is None:
-                if length_bins is None:
-                    p = np.array([DEFAULT_LENGTH_BIN_PROBS.get(k, 0.0) for k in bin_names], dtype=float)
-                    if p.sum() <= 0:
-                        p = None
-                    else:
-                        p = p / p.sum()
-                else:
-                    p = None
-            else:
-                # 允许传 dict: {"short":0.2,...} 或 list/np.array 与 bin_names 对齐
-                if isinstance(length_bin_probs, dict):
-                    p = np.array([float(length_bin_probs.get(k, 0.0)) for k in bin_names], dtype=float)
-                else:
-                    p = np.array(length_bin_probs, dtype=float)
-                if p.sum() <= 0:
-                    p = None
-                else:
-                    p = p / p.sum()
-
-            bin_name = rng.choice(bin_names, p=p)
-            low, high = bins_g[bin_name]
-            gate_count = int(rng.integers(low, high + 1))
-            target_qc = _build_random_circuit_by_gates(n_qubits, gate_count, rng)
-
-            tasks.append(
-                {
-                    "task_id": f"task_{idx}",
-                    "qc": target_qc,
-                    "n_qubits": n_qubits,
-                    "length_bin": bin_name,
-                        "target_gates": int(len(target_qc.data)),
-                }
-            )
-
-        elif mode == "depth":
-            bin_name = rng.choice(list(bins_d.keys()))
-            low, high = bins_d[bin_name]
-            target_depth = int(rng.integers(low, high + 1))
-            target_qc = _build_random_circuit_by_depth(n_qubits, target_depth, rng)
-
-            # 这里 length_bin 仍然保留（兼容 env），但语义是 depth 档位
-            tasks.append(
-                {
-                    "task_id": f"task_{idx}",
-                    "qc": target_qc,
-                    "n_qubits": n_qubits,
-                    "length_bin": f"depth::{bin_name}",
-                        "target_gates": int(len(target_qc.data)),
-                }
-            )
-
-        else:
-            raise ValueError("mode must be 'gates' or 'depth'.")
-
-    # shuffle & split
-    permutation = rng.permutation(len(tasks))
-    tasks = [tasks[i] for i in permutation]
-
-    split_idx = int(len(tasks) * 0.7)
-    train_tasks = tasks[:split_idx]
-    test_tasks = tasks[split_idx:]
-
-    return train_tasks, test_tasks
+# def _depth_after_append(act, layers):
+#     """
+#     用“ASAP layering”方式增量维护 depth（层数）。
+#     Qiskit 的 qc.depth() 对于这种顺序 append 的 DAG depth，本质就是最长依赖路径，
+#     这套 layers 更新可以非常稳定地等价（且比每步 qc.depth() 快得多）。
+#     """
+#     g = act["gate"]
+#     if g in SINGLE_GATES:
+#         q = act["target"]
+#         new_layer = layers[q] + 1
+#         new_max = max(max(layers), new_layer)
+#         return new_layer, None, new_max
+#     elif g == "CNOT":
+#         c, t = act["control"], act["target"]
+#         base = max(layers[c], layers[t]) + 1
+#         new_max = max(max(layers), base)
+#         return base, base, new_max
+#     else:
+#         return None, None, max(layers)
 
 
 
-# ---------------------
-# Stratified task generation (exact counts per (n_qubits, length_bin))
-# ---------------------
-def generate_task_suite_stratified(
-    seed: int,
-    n_qubits_choices=(2, 3, 4),
-    length_bins=None,
-    per_group=(40, 20, 10),  # (train, test, spare) per (n_qubits, bin)
-    mode="gates",            # currently supports "gates"; can be extended to "depth"
-    include_text_preview: bool = False,
-    preview_png_dir: str | None = None,
-    preview_sample_per_group: int = 0,  # 0 means "no preview". Recommend 1~3.
-):
-    """
-    分层生成任务：对每个 (n_qubits, length_bin) 组合，精确生成固定数量的任务，
-    然后在组内 shuffle 并切分为 train/test/spare。
 
-    任务 dict 格式（env 可直接读）：
-      {
-        "task_id": str,
-        "qc": QuantumCircuit,
-        "n_qubits": int,
-        "length_bin": str,
-        "target_gates": int,
-        # 可选（用于快速肉眼检查/调试）：
-        # "qc_text": str,  # ASCII 电路图
-        # "qc_png": str,   # 预览图 PNG 路径
-      }
 
-    参数说明：
-    - include_text_preview: 若 True，则为部分样本附加 qc_text（ASCII 图）。
-    - preview_png_dir: 若不为 None，则为部分样本导出 PNG 预览图到该目录，并写入 qc_png 路径。
-    - preview_sample_per_group: 每个 (n_qubits, bin) 组里生成多少个样本预览（默认 0 不生成）。
-      建议 1~3 即可；生成所有任务的 PNG 会很占空间/很慢。
+# def _build_random_circuit_by_gates(n_qubits: int, gate_count: int, rng: np.random.Generator):
+#     """
+#     按门数生成：每一步只从“合法动作”中采样（遵守你的 action mask 规则）。
+#     """
+#     # qc = QuantumCircuit(n_qubits)
+#     qc = QuantumCircuit(4)
+#     action_mapping = _all_actions(n_qubits)
 
-    例如：n_qubits_choices=(2,3,4)，length_bins=5 档，per_group=(40,20,10)
-      => 总数 = 3 * 5 * (40+20+10) = 1050
-      => train=600, test=300, spare=150
-    """
-    rng = np.random.default_rng(int(seed))
+#     op_table = []  # op_id -> act(dict)
+#     qubit_stacks = [[] for _ in range(n_qubits)]
 
-    if length_bins is None:
-        length_bins = DEFAULT_LENGTH_BINS
+#     for _ in range(gate_count):
+#         legal_ids = [
+#             i for i, a in enumerate(action_mapping)
+#             if _frontier_mask_is_legal(a, qubit_stacks, op_table, n_qubits)
+#         ]
+#         if not legal_ids:
+#             raise RuntimeError("No legal actions available (gate mode).")
 
-    if mode != "gates":
-        raise ValueError(f"Unsupported mode={mode}. Currently only supports 'gates'.")
+#         aid = int(rng.choice(legal_ids))
+#         act = action_mapping[aid]
 
-    # bins_g: {"short": (4,8), ...}
-    bins_g = dict(length_bins)
+#         # apply
+#         _apply_to_qiskit(qc, act)
 
-    n_train, n_test, n_spare = map(int, per_group)
-    group_total = n_train + n_test + n_spare
-    if group_total <= 0:
-        raise ValueError("per_group sums to 0; nothing to generate.")
+#         # update frontier table
+#         op_id = len(op_table)
+#         if act["gate"] == "CNOT":
+#             op_table.append({"gate": "CNOT", "control": act["control"], "target": act["target"]})
+#             qubit_stacks[act["control"]].append(op_id)
+#             qubit_stacks[act["target"]].append(op_id)
+#         else:
+#             op_table.append({"gate": act["gate"], "target": act["target"], "control": None})
+#             qubit_stacks[act["target"]].append(op_id)
 
-    # prepare preview dir if needed
-    if preview_png_dir is not None:
-        from pathlib import Path
-        Path(preview_png_dir).mkdir(parents=True, exist_ok=True)
+#     return qc
 
-    def _maybe_add_previews(task: dict, qc, n_previews_done: int, max_previews: int):
-        """Attach qc_text/qc_png for at most max_previews samples per group."""
-        if max_previews <= 0 or n_previews_done >= max_previews:
-            return False
 
-        if include_text_preview:
-            # ASCII circuit diagram (string)
-            try:
-                task["qc_text"] = qc.draw(output="text").single_string()
-            except Exception:
-                # fallback: basic repr
-                task["qc_text"] = str(qc)
+# def _build_random_circuit_by_depth(n_qubits: int, target_depth: int, rng: np.random.Generator,
+#                                    max_steps: int = 20000):
+#     """
+#     按深度（层数）生成：不断采样合法动作，但额外约束“新增后 depth 不能超过 target_depth”。
+#     一旦达到 target_depth 就停止（电路深度恰好等于 target_depth）。
+#     """
+#     if target_depth <= 0:
+#         # return QuantumCircuit(n_qubits)
+#         return QuantumCircuit(4)
 
-        if preview_png_dir is not None:
-            # Lazy import: only if actually requested
-            try:
-                fig = qc.draw(output="mpl")
-                png_path = f"{preview_png_dir}/{task['task_id']}.png"
-                fig.savefig(png_path, dpi=200, bbox_inches="tight")
-                # close figure to avoid memory leak
-                try:
-                    import matplotlib.pyplot as plt
-                    plt.close(fig)
-                except Exception:
-                    pass
-                task["qc_png"] = png_path
-            except Exception:
-                # If mpl drawing isn't available, just skip png
-                pass
+#     # qc = QuantumCircuit(n_qubits)
+#     qc = QuantumCircuit(4)
+#     action_mapping = _all_actions(n_qubits)
 
-        return True
+#     op_table = []
+#     qubit_stacks = [[] for _ in range(n_qubits)]
 
-    train_tasks, test_tasks, spare_tasks = [], [], []
-    global_idx = 0
+#     # layers[q] 表示该 qubit 当前最外层所在的层号（从 0 开始计数）
+#     layers = [0] * n_qubits
+#     current_depth = 0
 
-    # 固定顺序遍历，保证 seed 可复现
-    for n_qubits in list(n_qubits_choices):
-        n_qubits = int(n_qubits)
-        for bin_name in list(bins_g.keys()):
-            low, high = bins_g[bin_name]
+#     # 我们需要达到 target_depth（层数），这里把“层数”定义为 max(layers)
+#     # 初始没有门 depth=0；加一个门后 depth 至少变成 1
+#     steps = 0
+#     while current_depth < target_depth:
+#         steps += 1
+#         if steps > max_steps:
+#             # 理论上很少；如果你把 mask 规则再加严可能会触发
+#             raise RuntimeError("Depth sampling stuck. Increase max_steps or loosen constraints.")
 
-            group = []
-            previews_done = 0
+#         feasible_ids = []
+#         for i, a in enumerate(action_mapping):
+#             # 先过 mask
+#             if not _frontier_mask_is_legal(a, qubit_stacks, op_table, n_qubits):
+#                 continue
 
-            for _ in range(group_total):
-                gate_count = int(rng.integers(int(low), int(high) + 1))
-                target_qc = _build_random_circuit_by_gates(n_qubits, gate_count, rng)
+#             # 再过 depth 预算：新增后不能超过 target_depth
+#             if a["gate"] in SINGLE_GATES:
+#                 q = a["target"]
+#                 new_layer = layers[q] + 1
+#                 new_depth = max(current_depth, new_layer)
+#                 if new_depth <= target_depth:
+#                     feasible_ids.append(i)
+#             elif a["gate"] == "CNOT":
+#                 c, t = a["control"], a["target"]
+#                 base = max(layers[c], layers[t]) + 1
+#                 new_depth = max(current_depth, base)
+#                 if new_depth <= target_depth:
+#                     feasible_ids.append(i)
 
-                task = {
-                    "task_id": f"q{n_qubits}_{bin_name}_{global_idx}",
-                    "qc": target_qc,
-                    "n_qubits": n_qubits,
-                    "length_bin": bin_name,
-                    "target_gates": int(len(target_qc.data)),
-                }
+#         if not feasible_ids:
+#             # 这说明在当前状态下无法继续扩展到目标深度（极少见）
+#             # 最简单的处理：重来一次（rejection）
+#             return _build_random_circuit_by_depth(n_qubits, target_depth, rng, max_steps=max_steps)
 
-                # optional previews for a few samples in each group
-                if _maybe_add_previews(task, target_qc, previews_done, int(preview_sample_per_group)):
-                    previews_done += 1
+#         aid = int(rng.choice(feasible_ids))
+#         act = action_mapping[aid]
 
-                group.append(task)
-                global_idx += 1
+#         # apply
+#         _apply_to_qiskit(qc, act)
 
-            # 组内 shuffle，再切分
-            perm = rng.permutation(len(group))
-            group = [group[i] for i in perm]
+#         # update depth layers
+#         if act["gate"] in SINGLE_GATES:
+#             q = act["target"]
+#             layers[q] = layers[q] + 1
+#             current_depth = max(current_depth, layers[q])
+#         else:
+#             c, t = act["control"], act["target"]
+#             base = max(layers[c], layers[t]) + 1
+#             layers[c] = base
+#             layers[t] = base
+#             current_depth = max(current_depth, base)
 
-            train_tasks.extend(group[:n_train])
-            test_tasks.extend(group[n_train : n_train + n_test])
-            spare_tasks.extend(group[n_train + n_test :])
+#         # update frontier
+#         op_id = len(op_table)
+#         if act["gate"] == "CNOT":
+#             op_table.append({"gate": "CNOT", "control": act["control"], "target": act["target"]})
+#             qubit_stacks[act["control"]].append(op_id)
+#             qubit_stacks[act["target"]].append(op_id)
+#         else:
+#             op_table.append({"gate": act["gate"], "target": act["target"], "control": None})
+#             qubit_stacks[act["target"]].append(op_id)
 
-    # 最后再各自 shuffle 一下（不影响分层数量）
-    def _shuffle(lst):
-        if len(lst) <= 1:
-            return lst
-        p = rng.permutation(len(lst))
-        return [lst[i] for i in p]
+#     return qc
 
-    train_tasks = _shuffle(train_tasks)
-    test_tasks = _shuffle(test_tasks)
-    spare_tasks = _shuffle(spare_tasks)
 
-    return train_tasks, test_tasks, spare_tasks
+# def generate_task_suite(
+#     seed,
+#     n_tasks=60,
+#     n_qubits_choices=(2, 3, 4),
+#     length_bins=None,
+#     depth_bins=None,
+#     length_bin_probs=None,
+#     mode="gates",  # "gates" 或 "depth"
+# ):
+#     """
+#     生成随机任务集，每个任务包含目标电路。
+
+#     mode="gates": 使用 length_bins 采样 gate_count，生成 gate_count 个门
+#     mode="depth": 使用 depth_bins 采样 target_depth，生成深度恰好为 target_depth 的电路
+
+#     返回: (train_tasks, test_tasks)，切分比例 70% / 30%。
+#     """
+#     rng = np.random.default_rng(seed)
+
+#     bins_g = length_bins or DEFAULT_LENGTH_BINS
+#     bins_d = depth_bins or DEFAULT_DEPTH_BINS
+
+#     tasks = []
+#     for idx in range(n_tasks):
+#         n_qubits = int(rng.choice(n_qubits_choices))
+
+#         if mode == "gates":
+#             bin_names = list(bins_g.keys())
+#             # 如果你用默认 length_bins（为 None），就采用默认分布；否则默认均匀采样
+#             if length_bin_probs is None:
+#                 if length_bins is None:
+#                     p = np.array([DEFAULT_LENGTH_BIN_PROBS.get(k, 0.0) for k in bin_names], dtype=float)
+#                     if p.sum() <= 0:
+#                         p = None
+#                     else:
+#                         p = p / p.sum()
+#                 else:
+#                     p = None
+#             else:
+#                 # 允许传 dict: {"short":0.2,...} 或 list/np.array 与 bin_names 对齐
+#                 if isinstance(length_bin_probs, dict):
+#                     p = np.array([float(length_bin_probs.get(k, 0.0)) for k in bin_names], dtype=float)
+#                 else:
+#                     p = np.array(length_bin_probs, dtype=float)
+#                 if p.sum() <= 0:
+#                     p = None
+#                 else:
+#                     p = p / p.sum()
+
+#             bin_name = rng.choice(bin_names, p=p)
+#             low, high = bins_g[bin_name]
+#             gate_count = int(rng.integers(low, high + 1))
+#             target_qc = _build_random_circuit_by_gates(n_qubits, gate_count, rng)
+
+#             tasks.append(
+#                 {
+#                     "task_id": f"task_{idx}",
+#                     "qc": target_qc,
+#                     "n_qubits": n_qubits,
+#                     "length_bin": bin_name,
+#                         "target_gates": int(len(target_qc.data)),
+#                 }
+#             )
+
+#         elif mode == "depth":
+#             bin_name = rng.choice(list(bins_d.keys()))
+#             low, high = bins_d[bin_name]
+#             target_depth = int(rng.integers(low, high + 1))
+#             target_qc = _build_random_circuit_by_depth(n_qubits, target_depth, rng)
+
+#             # 这里 length_bin 仍然保留（兼容 env），但语义是 depth 档位
+#             tasks.append(
+#                 {
+#                     "task_id": f"task_{idx}",
+#                     "qc": target_qc,
+#                     "n_qubits": n_qubits,
+#                     "length_bin": f"depth::{bin_name}",
+#                         "target_gates": int(len(target_qc.data)),
+#                 }
+#             )
+
+#         else:
+#             raise ValueError("mode must be 'gates' or 'depth'.")
+
+#     # shuffle & split
+#     permutation = rng.permutation(len(tasks))
+#     tasks = [tasks[i] for i in permutation]
+
+#     split_idx = int(len(tasks) * 0.7)
+#     train_tasks = tasks[:split_idx]
+#     test_tasks = tasks[split_idx:]
+
+#     return train_tasks, test_tasks
+
+
+
+# # ---------------------
+# # Stratified task generation (exact counts per (n_qubits, length_bin))
+# # ---------------------
+# def generate_task_suite_stratified(
+#     seed: int,
+#     n_qubits_choices=(2, 3, 4),
+#     length_bins=None,
+#     per_group=(40, 20, 10),  # (train, test, spare) per (n_qubits, bin)
+#     mode="gates",            # currently supports "gates"; can be extended to "depth"
+#     include_text_preview: bool = False,
+#     preview_png_dir: str | None = None,
+#     preview_sample_per_group: int = 0,  # 0 means "no preview". Recommend 1~3.
+# ):
+#     """
+#     分层生成任务：对每个 (n_qubits, length_bin) 组合，精确生成固定数量的任务，
+#     然后在组内 shuffle 并切分为 train/test/spare。
+
+#     任务 dict 格式（env 可直接读）：
+#       {
+#         "task_id": str,
+#         "qc": QuantumCircuit,
+#         "n_qubits": int,
+#         "length_bin": str,
+#         "target_gates": int,
+#         # 可选（用于快速肉眼检查/调试）：
+#         # "qc_text": str,  # ASCII 电路图
+#         # "qc_png": str,   # 预览图 PNG 路径
+#       }
+
+#     参数说明：
+#     - include_text_preview: 若 True，则为部分样本附加 qc_text（ASCII 图）。
+#     - preview_png_dir: 若不为 None，则为部分样本导出 PNG 预览图到该目录，并写入 qc_png 路径。
+#     - preview_sample_per_group: 每个 (n_qubits, bin) 组里生成多少个样本预览（默认 0 不生成）。
+#       建议 1~3 即可；生成所有任务的 PNG 会很占空间/很慢。
+
+#     例如：n_qubits_choices=(2,3,4)，length_bins=5 档，per_group=(40,20,10)
+#       => 总数 = 3 * 5 * (40+20+10) = 1050
+#       => train=600, test=300, spare=150
+#     """
+#     rng = np.random.default_rng(int(seed))
+
+#     if length_bins is None:
+#         length_bins = DEFAULT_LENGTH_BINS
+
+#     if mode != "gates":
+#         raise ValueError(f"Unsupported mode={mode}. Currently only supports 'gates'.")
+
+#     # bins_g: {"short": (4,8), ...}
+#     bins_g = dict(length_bins)
+
+#     n_train, n_test, n_spare = map(int, per_group)
+#     group_total = n_train + n_test + n_spare
+#     if group_total <= 0:
+#         raise ValueError("per_group sums to 0; nothing to generate.")
+
+#     # prepare preview dir if needed
+#     if preview_png_dir is not None:
+#         from pathlib import Path
+#         Path(preview_png_dir).mkdir(parents=True, exist_ok=True)
+
+#     def _maybe_add_previews(task: dict, qc, n_previews_done: int, max_previews: int):
+#         """Attach qc_text/qc_png for at most max_previews samples per group."""
+#         if max_previews <= 0 or n_previews_done >= max_previews:
+#             return False
+
+#         if include_text_preview:
+#             # ASCII circuit diagram (string)
+#             try:
+#                 task["qc_text"] = qc.draw(output="text").single_string()
+#             except Exception:
+#                 # fallback: basic repr
+#                 task["qc_text"] = str(qc)
+
+#         if preview_png_dir is not None:
+#             # Lazy import: only if actually requested
+#             try:
+#                 fig = qc.draw(output="mpl")
+#                 png_path = f"{preview_png_dir}/{task['task_id']}.png"
+#                 fig.savefig(png_path, dpi=200, bbox_inches="tight")
+#                 # close figure to avoid memory leak
+#                 try:
+#                     import matplotlib.pyplot as plt
+#                     plt.close(fig)
+#                 except Exception:
+#                     pass
+#                 task["qc_png"] = png_path
+#             except Exception:
+#                 # If mpl drawing isn't available, just skip png
+#                 pass
+
+#         return True
+
+#     train_tasks, test_tasks, spare_tasks = [], [], []
+#     global_idx = 0
+
+#     # 固定顺序遍历，保证 seed 可复现
+#     for n_qubits in list(n_qubits_choices):
+#         n_qubits = int(n_qubits)
+#         for bin_name in list(bins_g.keys()):
+#             low, high = bins_g[bin_name]
+
+#             group = []
+#             previews_done = 0
+
+#             for _ in range(group_total):
+#                 gate_count = int(rng.integers(int(low), int(high) + 1))
+#                 target_qc = _build_random_circuit_by_gates(n_qubits, gate_count, rng)
+
+#                 task = {
+#                     "task_id": f"q{n_qubits}_{bin_name}_{global_idx}",
+#                     "qc": target_qc,
+#                     "n_qubits": n_qubits,
+#                     "length_bin": bin_name,
+#                     "target_gates": int(len(target_qc.data)),
+#                 }
+
+#                 # optional previews for a few samples in each group
+#                 if _maybe_add_previews(task, target_qc, previews_done, int(preview_sample_per_group)):
+#                     previews_done += 1
+
+#                 group.append(task)
+#                 global_idx += 1
+
+#             # 组内 shuffle，再切分
+#             perm = rng.permutation(len(group))
+#             group = [group[i] for i in perm]
+
+#             train_tasks.extend(group[:n_train])
+#             test_tasks.extend(group[n_train : n_train + n_test])
+#             spare_tasks.extend(group[n_train + n_test :])
+
+#     # 最后再各自 shuffle 一下（不影响分层数量）
+#     def _shuffle(lst):
+#         if len(lst) <= 1:
+#             return lst
+#         p = rng.permutation(len(lst))
+#         return [lst[i] for i in p]
+
+#     train_tasks = _shuffle(train_tasks)
+#     test_tasks = _shuffle(test_tasks)
+#     spare_tasks = _shuffle(spare_tasks)
+
+#     return train_tasks, test_tasks, spare_tasks
 
 # ----------------------------
 # Storage helpers (Recommended)
@@ -550,21 +689,36 @@ def save_task_suite(out_dir: str, name: str, tasks: list[dict]) -> None:
             row = {
                 "task_id": t["task_id"],
                 "n_qubits": int(t["n_qubits"]),
-                "length_bin": t["length_bin"],
-                "target_gates": int(t.get("target_gates", len(t["qc"].data))),
+                "target_gates": int(t["target_gates"]),
             }
+
+            # Backward-compatible bins
+            if "length_bin" in t:
+                row["length_bin"] = t["length_bin"]
+            if "difficulty_bin" in t:
+                row["difficulty_bin"] = t["difficulty_bin"]
+
+            # Difficulty score (recommended)
+            if "difficulty_score" in t:
+                row["difficulty_score"] = int(t["difficulty_score"])
+            
             if "qc_text" in t:
                 row["qc_text"] = t["qc_text"]
             if "qc_png" in t:
                 row["qc_png"] = t["qc_png"]
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-
 def load_task_suite(in_dir: str, name: str) -> list[dict]:
     """
-    Load tasks saved by save_task_suite().
-    Returns a list of task dicts with the same keys:
-      task_id, qc, n_qubits, length_bin, target_gates, (optional) qc_text, qc_png
+    Load tasks from disk:
+      - Read circuits from: <in_dir>/<name>_circuits.qpy
+      - Read metadata from: <in_dir>/<name>_meta.jsonl
+
+    Returns: List[dict] tasks, each contains at least:
+      - qc (QuantumCircuit)
+      - task_id, n_qubits, target_gates
+    And optionally:
+      - length_bin, difficulty_bin, difficulty_score, qc_text, qc_png
     """
     import json
     from pathlib import Path
@@ -574,33 +728,50 @@ def load_task_suite(in_dir: str, name: str) -> list[dict]:
     qpy_path = inp / f"{name}_circuits.qpy"
     meta_path = inp / f"{name}_meta.jsonl"
 
+    # ---- 1) Load circuits ----
     with qpy_path.open("rb") as f:
-        circuits = qpy.load(f)
+        circuits = list(qpy.load(f))
 
-    meta = []
+    # ---- 2) Load metadata ----
+    metas = []
     with meta_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            meta.append(json.loads(line))
+            metas.append(json.loads(line))
 
-    if len(circuits) != len(meta):
-        raise ValueError(f"Mismatch: circuits={len(circuits)} meta={len(meta)}")
+    if len(circuits) != len(metas):
+        raise ValueError(
+            f"Mismatch: {qpy_path.name} has {len(circuits)} circuits, "
+            f"but {meta_path.name} has {len(metas)} metadata rows."
+        )
 
     tasks = []
-    for qc, m in zip(circuits, meta):
+    for qc, m in zip(circuits, metas):
         t = {
-            "task_id": m["task_id"],
             "qc": qc,
-            "n_qubits": int(m["n_qubits"]),
-            "length_bin": m["length_bin"],
+            "task_id": m.get("task_id", ""),
+            "n_qubits": int(m.get("n_qubits", qc.num_qubits)),
             "target_gates": int(m.get("target_gates", len(qc.data))),
         }
+
+        # Backward-compatible bins
+        if "length_bin" in m:
+            t["length_bin"] = m["length_bin"]
+        if "difficulty_bin" in m:
+            t["difficulty_bin"] = m["difficulty_bin"]
+
+        # Difficulty score (recommended)
+        if "difficulty_score" in m:
+            t["difficulty_score"] = int(m["difficulty_score"])
+
+        # Optional extras
         if "qc_text" in m:
             t["qc_text"] = m["qc_text"]
         if "qc_png" in m:
             t["qc_png"] = m["qc_png"]
+
         tasks.append(t)
 
     return tasks
