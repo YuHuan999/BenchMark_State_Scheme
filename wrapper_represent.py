@@ -16,7 +16,7 @@ class RepresentationWrapper(gym.Wrapper):
             # 这里先用最通用的 Dict，state 的空间你自己按 scheme 填
             spaces = {"state": env.observation_space}  # 先占位：gate_seq
             if expose_mask:
-                spaces["mask"] = gym.spaces.MultiBinary(env.action_space.n)
+                spaces["action_mask"] = gym.spaces.MultiBinary(env.action_space.n)
             self.observation_space = gym.spaces.Dict(spaces)
 
     def _to_representation(self, canonical_obs, info):
@@ -46,7 +46,7 @@ class RepresentationWrapper(gym.Wrapper):
             mask = info.get("action_mask", None)
             if mask is None:
                 raise KeyError("env must provide info['action_mask'] when expose_mask=True")
-            obs = {"state": state, "mask": mask.astype(np.int8)}
+            obs = {"state": state, "action_mask": mask.astype(np.int8)}
         else:
             obs = {"state": state}
 
@@ -60,7 +60,7 @@ class RepresentationWrapper(gym.Wrapper):
             mask = info.get("action_mask", None)
             if mask is None:
                 raise KeyError("env must provide info['action_mask'] when expose_mask=True")
-            obs = {"state": state, "mask": mask.astype(np.int8)}
+            obs = {"state": state, "action_mask": mask.astype(np.int8)}
         else:
             obs = {"state": state}
 

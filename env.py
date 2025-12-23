@@ -18,7 +18,7 @@ class CircuitDesignerDiscrete(gym.Env):
 
     def __init__(
         self,
-        max_depth: int,
+        
         task_pool=None,
         train_tasks=None,
         test_tasks=None,
@@ -27,6 +27,7 @@ class CircuitDesignerDiscrete(gym.Env):
         mode='train',
         max_qubits=4,   # 统一 one-hot 编码
         max_gates=78,   # 统一神经网络输入维度
+        max_depth = 78,
         fidelity_threshold: float = 0.99,
         success_reward: float = 6.0,
         fail_reward: float = -5.0,
@@ -66,7 +67,8 @@ class CircuitDesignerDiscrete(gym.Env):
         self.target_unitary = None
         self.gates_target = 0
         self.current_task_id = None
-        self.current_length_bin = None ## 当前任务的“长度分箱/难度档位”标签
+        # 任务难度档位（兼容旧的 length_bin，现统一使用 difficulty_bin）
+        self.current_difficulty_bin = None
         self.gate_tokens = []
         self._qubit_stacks = [[] for _ in range(self.n_qubits)]
         self.fidelities = []
@@ -137,17 +139,18 @@ class CircuitDesignerDiscrete(gym.Env):
         assert task["qc"].num_qubits == 4, f"target qc should be 4-qubit, got {task['qc'].num_qubits}"
         assert 2 <= task["n_qubits"] <= 4
         
-        """解析任务条目，返回 (task_id, target_qc, length_bin)。"""
+        """解析任务条目，返回 (task_id, target_qc, difficulty_bin)。"""
         task_id = None
         target_qc = None
-        length_bin = None
+        difficulty_bin = None
         gates_count = None
 
 
         if isinstance(task, dict):
             task_id = task.get('id') or task.get('task_id')
             target_qc = task.get('qc') or task.get('circuit') or task.get('target')
-            length_bin = task.get('length_bin')
+            # 新字段 difficulty_bin 优先，兼容旧的 length_bin
+            difficulty_bin = task.get('difficulty_bin', task.get('length_bin'))
             gates_count = len(target_qc.data)
         elif isinstance(task, (tuple, list)) and len(task) == 2:
             task_id, target_qc = task
@@ -160,7 +163,7 @@ class CircuitDesignerDiscrete(gym.Env):
         if not isinstance(target_qc, QuantumCircuit):
             raise TypeError("task_pool 中的目标需为 QuantumCircuit。")
 
-        return str(task_id), target_qc, length_bin, gates_count
+        return str(task_id), target_qc, difficulty_bin, gates_count
 
     def _sample_task(self):
         """从任务池中随机抽取一个任务"""
@@ -382,8 +385,12 @@ class CircuitDesignerDiscrete(gym.Env):
             self._np_random, _ = gym.utils.seeding.np_random(seed)
 
         # 采样任务
-        self.current_task_id, self.target_qc, self.current_length_bin, self.gates_target = self._sample_task()
-        self.task_budget = int(self.gates_target * 1.3)
+        self.current_task_id, self.target_qc, self.current_difficulty_bin, self.gates_target = self._sample_task()
+        # tianshou 的 buffer.hasnull 会把 None 视为缺失值并直接报错（MalformedBufferError）
+        # 有些任务缺少 difficulty_bin，统一用字符串占位，避免 None 进入 info
+        safe_diff_bin = self.current_difficulty_bin if self.current_difficulty_bin is not None else "NA"
+        # max_steps ≈ 1.3 * L，向上取整避免过早截断
+        self.task_budget = max(1, int(np.ceil(self.gates_target * 1.3)))
         # ---- Route A: enforce fixed qubits ----
         task_nq = int(self.target_qc.num_qubits)
         env_nq = int(self.max_qubits)  # 也就是 init 传进来的 max_qubits
@@ -418,7 +425,7 @@ class CircuitDesignerDiscrete(gym.Env):
             "depth": self.current_depth,
             "task_id": self.current_task_id,
             "n_qubits": int(self.n_qubits),
-            "length_bin": self.current_length_bin,
+            "difficulty_bin": safe_diff_bin,
             "action_mask": self._action_mask(),
         }
         return obs, info
@@ -435,37 +442,44 @@ class CircuitDesignerDiscrete(gym.Env):
         mask = self._action_mask()
 
         aid = -1 if action_id is None else int(action_id)
-        illegal = (
-            action_id is None
-            or aid < 0
-            or aid >= len(self.actions)
-            or mask[aid] == 0
-        )
 
-        if not illegal:
-            operation = self._operation(aid)
-            if operation is None:
-                illegal = True
-            else:
-                self._qc.append(*operation)
-                self.gate_tokens.append(aid)
+        def _raise_illegal(reason: str):
+            raise ValueError(
+                f"Illegal action: {reason}. "
+                f"action_id={action_id}, aid={aid}, "
+                f"mask_sum={int(mask.sum())}, "
+                f"len_actions={len(self.actions)}, "
+                f"gates={self.current_gates}, depth={self.current_depth}, "
+                f"task_id={self.current_task_id}"
+            )
 
-                act = self.actions[aid]
-                g = act['gate']
-                if g in self.single_gates:
-                    q = act['target']
-                    self._qubit_stacks[q].append(aid)
-                elif g == 'CNOT':
-                    c, t = act['control'], act['target']
-                    self._qubit_stacks[c].append(aid)
-                    self._qubit_stacks[t].append(aid)
+        if action_id is None:
+            _raise_illegal("action is None")
+        if aid < 0 or aid >= len(self.actions):
+            _raise_illegal("action id out of range")
+        if mask[aid] == 0:
+            _raise_illegal("action is masked out (illegal)")
 
-                self.qc_operator = Operator(self._qc)
-                self.current_depth = self._qc.depth()
-                self.current_gates = len(self._qc.data)
-        else:
-            self.current_depth = self._qc.depth()
-            self.current_gates = len(self._qc.data)
+        operation = self._operation(aid)
+        if operation is None:
+            _raise_illegal("operation lookup returned None")
+
+        self._qc.append(*operation)
+        self.gate_tokens.append(aid)
+
+        act = self.actions[aid]
+        g = act['gate']
+        if g in self.single_gates:
+            q = act['target']
+            self._qubit_stacks[q].append(aid)
+        elif g == 'CNOT':
+            c, t = act['control'], act['target']
+            self._qubit_stacks[c].append(aid)
+            self._qubit_stacks[t].append(aid)
+
+        self.qc_operator = Operator(self._qc)
+        self.current_depth = self._qc.depth()
+        self.current_gates = len(self._qc.data)
 
         fidelity = float(self._compute_fidelity())
 
@@ -486,18 +500,19 @@ class CircuitDesignerDiscrete(gym.Env):
 
         obs = self._observation()
         mask_next = self._action_mask()
+        safe_diff_bin = self.current_difficulty_bin if self.current_difficulty_bin is not None else "NA"
         info = {
             "fidelity": fidelity,
             "step_count": len(self.gate_tokens),
             "gate_count": int(self.current_gates),
             "task_id": self.current_task_id,
             "n_qubits": self.n_qubits,
-            "length_bin": self.current_length_bin,
+            "difficulty_bin": safe_diff_bin,
             "depth": int(self.current_depth),
             "action_mask": mask_next,
             "reached_max_depth": bool(reached_max_depth),
             "reached_budget": bool(reached_budget),
-            "illegal_action": bool(illegal),
+            "illegal_action": False,  # 若有非法动作会在前面直接抛错
         }
 
         self.fidelities.append(fidelity)
