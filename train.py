@@ -1,4 +1,8 @@
 import sys
+import os
+import io
+from datetime import datetime
+from contextlib import redirect_stdout, redirect_stderr
 sys.path.insert(0, r"E:\Projects\BenchMark_state_scheme\tianshou")
 
 # import tianshou
@@ -41,21 +45,26 @@ def normalize_tasks(tasks):
 def make_env(train_tasks, test_tasks, mode, scheme,
              seed=None, fidelity_threshold=0.99,
              success_reward=6.0, fail_reward=-5.0,
-             gates_penalty=1.0, render_mode=None, task_pool=None):
+             gates_penalty=1.0, render_mode=None, task_pool=None,
+             max_gates=None):
 
-    env = CircuitDesignerDiscrete(
+    env_kwargs = dict(
         task_pool=task_pool,
         train_tasks=train_tasks,
         test_tasks=test_tasks,
         seed=seed,
         render_mode=render_mode,
         mode=mode,
-        fidelity_threshold=fidelity_threshold,  
+        fidelity_threshold=fidelity_threshold,
         success_reward=success_reward,
         fail_reward=fail_reward,
         gates_penalty=gates_penalty,
-        # mode=mode  # 只有当你的 env __init__ 真有 mode 参数才传
     )
+    # 允许从 train_cfg 显式控制观测长度；不传则沿用 env 的默认值
+    if max_gates is not None:
+        env_kwargs["max_gates"] = int(max_gates)
+
+    env = CircuitDesignerDiscrete(**env_kwargs)
     env = RepresentationWrapper(env, scheme=scheme)
     return env
 
@@ -200,12 +209,17 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
     # 2) 构建并行训练 env（同一个任务，不同 seed）
     # -----------------------
     fidelity_threshold_cfg = float(train_cfg.get("fidelity_threshold", 0.99))
+    early_stop_on_success = bool(train_cfg.get("early_stop_on_success", True))
+    early_stop_consecutive = int(train_cfg.get("early_stop_consecutive_success", 1))
+    early_stop_consecutive = max(1, early_stop_consecutive)
+    max_gates_cfg = train_cfg.get("max_gates", None)
     train_envs = DummyVectorEnv([
         (lambda i=i: (lambda: make_env(
             train_tasks, test_tasks,
             mode="train", scheme=scheme,
             seed=seed + i,
             fidelity_threshold=fidelity_threshold_cfg,
+            max_gates=max_gates_cfg,
         )))()
         for i in range(n_train_env)
     ])
@@ -216,6 +230,7 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         mode="test", scheme=scheme,
         seed=seed + 10_000,
         fidelity_threshold=fidelity_threshold_cfg,
+        max_gates=max_gates_cfg,
     )
 
     # dummy env 推断维度
@@ -224,6 +239,7 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         mode="train", scheme=scheme,
         seed=seed + 999,
         fidelity_threshold=fidelity_threshold_cfg,
+        max_gates=max_gates_cfg,
     )
     act_dim = int(dummy.action_space.n)
     max_gates = int(dummy.max_gates)
@@ -289,6 +305,7 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         actor.eval()
         succ = 0
         fids = []
+        best_qasm = None
         for ep in range(eval_episodes):
             obs, info = eval_env.reset(seed=seed + 20_000 + ep)
             done = False
@@ -307,7 +324,12 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
             fids.append(F)
             if F >= fidelity_threshold:
                 succ += 1
-        return succ, float(np.mean(fids)) if fids else 0.0
+                # 保留成功时的电路（qasm）
+                try:
+                    best_qasm = eval_env._qc.qasm()  # noqa: SLF001
+                except Exception:
+                    best_qasm = None
+        return succ, float(np.mean(fids)) if fids else 0.0, best_qasm
 
     # -----------------------
     # 6) 训练循环：每 eval_every_steps 训练一次 + 评估一次
@@ -322,8 +344,18 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
     best_fidelity = -1.0
     final_fidelity = -1.0
     t_solve = None
+    solved_qasm = None
+    # 记录目标电路的 qasm 便于对比
+    target_qasm = None
+    try:
+        target_qc = task.get("qc") or task.get("target_qc")
+        if target_qc is not None:
+            target_qasm = target_qc.qasm()
+    except Exception:
+        target_qasm = None
 
     trained = 0
+    consecutive_successes = 0  # 连续成功的评估次数
     while trained < total_budget_steps:
         this_chunk = min(eval_every_steps, total_budget_steps - trained)
 
@@ -354,7 +386,7 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         trained += this_chunk
 
         # 评估
-        succ, mean_F = greedy_eval()
+        succ, mean_F, solved_qasm_candidate = greedy_eval()
         final_fidelity = mean_F
         best_fidelity = max(best_fidelity, mean_F)
 
@@ -362,7 +394,16 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
             solved = True
             steps_to_solve = trained
             t_solve = time.time() - t0   # 第一次成功的耗时
-            break  ## 暂时这样做，评估成功了就退出
+            if solved_qasm is None:
+                solved_qasm = solved_qasm_candidate
+        # 连续成功计数（用于更稳健的提前停止）
+        if succ > 0:
+            consecutive_successes += 1
+        else:
+            consecutive_successes = 0
+
+        if early_stop_on_success and consecutive_successes >= early_stop_consecutive:
+            break
 
     wall_time = time.time() - t0
 
@@ -384,6 +425,8 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         "final_fidelity": float(final_fidelity),
         "wall_time_sec": float(wall_time),
         "time_to_solve_sec": float(t_solve) if t_solve is not None else wall_time * 10,
+        "solved_qasm": solved_qasm,
+        "target_qasm": target_qasm,
     }
 
 def summarize_metrics(records, fidelity_threshold=0.99):
@@ -559,6 +602,131 @@ def run_stage(
         "records_by_cfg": all_records_by_cfg,
     }
 
+def run_suite_all_tasks(
+    *,
+    in_dir: str,
+    suite_name: str,
+    scheme: str,
+    net_cfg_list: list,
+    algo_cfg: dict,
+    train_cfg: dict,
+    seeds: list,
+    device: str,
+    verbose: bool = True,
+):
+    """
+    在指定任务集上运行所有任务（不抽样），按 net_cfg 列出总结并排序。
+    复用 run_cfg_on_taskset，排序规则与 run_stage 保持一致。
+    """
+    tasks = normalize_tasks(load_task_suite(in_dir, suite_name))
+
+    if verbose:
+        print(f"\n=== Run full suite {suite_name} / scheme={scheme} ===")
+        print("All task_ids:", [t.get("task_id") for t in tasks])
+
+    all_summaries = []
+    all_records_by_cfg = {}
+
+    for net_cfg in net_cfg_list:
+        records, summary = run_cfg_on_taskset(
+            stage_name=suite_name,
+            tasks=tasks,
+            scheme=scheme,
+            net_cfg=net_cfg,
+            algo_cfg=algo_cfg,
+            train_cfg=train_cfg,
+            device=device,
+            seeds=seeds,
+            verbose=verbose,
+        )
+        all_records_by_cfg[net_cfg.get("name", "net_cfg")] = records
+        all_summaries.append(summary)
+
+    def rank_key(s):
+        steps = s["mean_steps_to_solve"]
+        steps_key = steps if steps is not None else 1e18
+        return (-s["success_rate"], steps_key, -s["mean_best_fidelity"], s["mean_wall_time_sec"])
+
+    all_summaries_sorted = sorted(all_summaries, key=rank_key)
+
+    if verbose:
+        print("\n=== Ranking ===")
+        for i, s in enumerate(all_summaries_sorted):
+            print(
+                f"{i+1:02d}. {s['net_cfg_name']}  "
+                f"succ={s['success_rate']:.3f}  "
+                f"mean_steps={s['mean_steps_to_solve']}  "
+                f"bestF={s['mean_best_fidelity']:.4f}  "
+                f"finalF={s['mean_final_fidelity']:.4f}  "
+                f"time={s['mean_wall_time_sec']:.1f}s"
+            )
+
+    return {
+        "tasks": tasks,
+        "summaries_sorted": all_summaries_sorted,
+        "summaries_raw": all_summaries,
+        "records_by_cfg": all_records_by_cfg,
+    }
+
+
+def load_task_by_id(in_dir: str, suite_name: str, task_id: str) -> Dict[str, Any]:
+    """从指定任务集加载并返回单个 task（按 task_id 匹配）。"""
+    tasks = normalize_tasks(load_task_suite(in_dir, suite_name))
+    matches = [t for t in tasks if str(t.get("task_id")) == str(task_id)]
+    if not matches:
+        raise KeyError(f"task_id={task_id} not found in suite {suite_name}")
+    if len(matches) > 1:
+        print(f"[warn] found {len(matches)} tasks with task_id={task_id}, use the first one.")
+    return matches[0]
+
+
+def run_task_by_id(
+    *,
+    in_dir: str,
+    suite_name: str,
+    task_id: str,
+    scheme: str,
+    net_cfg_list: list,
+    algo_cfg: dict,
+    train_cfg: dict,
+    seeds: list,
+    device: str,
+    verbose: bool = True,
+):
+    """
+    入口：指定任务集 + task_id，只运行这个任务的训练与评估。
+    用法示例：
+      run_task_by_id(
+          in_dir="task_suites",
+          suite_name="Dev",
+          task_id="task_22",
+          scheme="gate_seq",
+          net_cfg_list=[...],
+          algo_cfg=algo_cfg,
+          train_cfg=train_cfg,
+          seeds=[0],
+          device="cuda",
+      )
+    """
+    task = load_task_by_id(in_dir, suite_name, task_id)
+    all_summaries = []
+    all_records_by_cfg = {}
+    for net_cfg in net_cfg_list:
+        records, summary = run_cfg_on_taskset(
+            stage_name=suite_name,
+            tasks=[task],
+            scheme=scheme,
+            net_cfg=net_cfg,
+            algo_cfg=algo_cfg,
+            train_cfg=train_cfg,
+            device=device,
+            seeds=seeds,
+            verbose=verbose,
+        )
+        all_records_by_cfg[net_cfg.get("name", "net_cfg")] = records
+        all_summaries.append(summary)
+    return {"summaries": all_summaries, "records_by_cfg": all_records_by_cfg}
+
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -664,36 +832,50 @@ def main():
 
 
 if __name__ == "__main__":
-
-    
+  
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 任务集
     in_dir = "task_suites"
-    suite_name = "Dev"
+    suite_name = "Guided"
     scheme = "gate_seq"
 
     # 抽样：你给的 bin_counts
-    bin_counts = [5, 0, 0, 0, 0]
+    bin_counts = [1, 0, 0, 0, 0]
     task_sample_seed = 123
 
     # ----------------
     # 1) network configs (baseline grid)
     #   说明：net_cfg 通过 Encoder_MLP.from_cfg + SharedMLP 共同生效
     # ----------------
+    
     net_cfg_list = [
-        # 超小：先看 pipeline 能不能稳定跑通 + 是否能在 easy/medium 上有信号
-        # {"name": "hid64_ln",   "hid": 64,  "use_ln": True,  "shared_act": "silu", "act": "silu"},
-        # {"name": "hid64_noln", "hid": 64,  "use_ln": False, "shared_act": "silu", "act": "silu"},
+    # ====== Tiny / Smoke（主要看 pipeline & reward 是否有信号）======
+    # {"name": "E055k_h64_d2",  "hid": 64,  "depth": 2, "act": "silu", "use_ln": True,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-        # 小：通常是“最小可用”baseline（建议重点看这个）
-        {"name": "hid128_ln",   "hid": 128, "use_ln": True,  "shared_act": "silu", "act": "silu"},
-        {"name": "hid128_noln", "hid": 128, "use_ln": False, "shared_act": "silu", "act": "silu"},
+    # # ====== Small（你现在的 128 档，建议作为“最小可用 baseline”）======
+    # {"name": "E118k_h128_d2", "hid": 128, "depth": 2, "act": "silu", "use_ln": True,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-        # 中：如果 128 明显不够，再看 256
-        # {"name": "hid256_ln",   "hid": 256, "use_ln": True,  "shared_act": "silu", "act": "silu"},
-        # {"name": "hid256_noln", "hid": 256, "use_ln": False, "shared_act": "silu", "act": "silu"},
+    # ====== Medium（通常足够覆盖 easy~hard，并开始挑战 very_hard）======
+    {"name": "E268k_h256_d2", "hid": 256, "depth": 2, "act": "silu", "use_ln": True,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== Medium+（更“深”而不是更“宽”，对你这种 token-onehot+flatten 的任务往往更划算）======
+    {"name": "E334k_h256_d3", "hid": 256, "depth": 3, "act": "silu", "use_ln": True,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== Large（开始针对接近你设定的最难阈值那一档）======
+    {"name": "E451k_h384_d2", "hid": 384, "depth": 2, "act": "silu", "use_ln": True,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== XL（只有当 Large 仍明显不够时再开；否则很浪费预算）======
+    {"name": "E667k_h512_d2", "hid": 512, "depth": 2, "act": "silu", "use_ln": True,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
     ]
+        
+            
 
     # ----------------
     # 2) PPO algo cfg (两个版本：标准 / 更强探索)
@@ -716,10 +898,10 @@ if __name__ == "__main__":
     #   注意：run_one_task 里每 eval_every_steps 会重新建一次 on-policy buffer
     # ----------------
     train_cfg = {
-        "n_train_env": 8,
+        "n_train_env": 8, 
 
         # 先别太大：调 bug / 看趋势用 30k~50k 更合适
-        "total_budget_steps": 500000,
+        "total_budget_steps": 500000, 
 
         # 每 5k 做一次 greedy_eval（steps_to_solve 粒度也就是 5k）
         "eval_every_steps": 5000,
@@ -735,65 +917,55 @@ if __name__ == "__main__":
 
         # 需要的话你也能显式写死阈值（否则从 env 里读）
         "fidelity_threshold": 0.9,
+
+        # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
+        "max_gates": 14,
+
+        # 评估成功后直接提前停掉，节省预算
+        "early_stop_on_success": True,
+        # 连续成功多少次才提前停（>=1）
+        "early_stop_consecutive_success": 3,
     }
 
     # ----------------
     # 4) seeds（先 smoke：1 个；跑 baseline：2~3 个）
     # ----------------
-    seeds = [0, 1, 2]
+    seeds = [0, 1, 2] 
 
+    # ----------------
+    # 5) 日志：stdout/stderr 同时写到文件，便于后续查看
+    # ----------------
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 定制日志文件名（同目录下），便于直接查阅
+    log_path = os.path.join(log_dir, "E268k_h256_d2_log.log")
 
-    # # 你要粗筛的网络结构列表（HPO 就是枚举/采样这些）
-    # net_cfg_list = [
-    #     {"name": "hid256_ln", "hid": 256, "use_ln": True,  "shared_act": "silu"},
-    #     {"name": "hid256_noln", "hid": 256, "use_ln": False, "shared_act": "silu"},
-    #     {"name": "hid128_ln", "hid": 128, "use_ln": True,  "shared_act": "silu"},
-    # ]
+    class Tee(io.TextIOBase):
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+            return len(data)
+        def flush(self):
+            for s in self.streams:
+                s.flush()
 
-    # # 算法超参（你可以先固定住）
-    # algo_cfg = {
-    #     "lr": 3e-4,
-    #     "gamma": 0.99,
-    #     "gae_lambda": 0.95,
-    #     "max_grad_norm": 0.5,
-    #     "eps_clip": 0.2,
-    #     "vf_coef": 0.5,
-    #     "ent_coef": 0.01,
-    #     "advantage_normalization": True,
-    #     "value_clip": False,
-    # }
+    with open(log_path, "w", encoding="utf-8") as f, \
+         redirect_stdout(Tee(sys.stdout, f)), \
+         redirect_stderr(Tee(sys.stderr, f)):
 
-    # # 训练资源（预算）
-    # train_cfg = {
-    #     "n_train_env": 8,
-    #     "total_budget_steps": 100000,
-    #     "eval_every_steps": 10000,
-    #     "eval_episodes": 1,
-    #     "collect_steps": 2048,
-    #     "update_reps": 6,
-    #     "batch_size": 256,
-    #     "buffer_size": 20000,
-    #     # "fidelity_threshold": 0.99,  # 可选：你也可以从 env 读
-    # }
-
-    # # 多 seed（完成概率就靠它）
-    # seeds = [0, 1, 2]
-
-    out = run_stage(
-        in_dir=in_dir,
-        suite_name=suite_name,
-        scheme=scheme,
-        bin_counts=bin_counts,
-        task_sample_seed=task_sample_seed,
-        net_cfg_list=net_cfg_list,
-        algo_cfg=algo_cfg,
-        train_cfg=train_cfg,
-        seeds=seeds,
-        device=device,
-        verbose=True,
-    )
-
-    # out["summaries_sorted"] 就是粗筛结果
-    # out["records_by_cfg"] 里是所有明细（后续你可以保存成 jsonl/csv）
-
-
+        print(f"[log] writing to {log_path}")
+        run_suite_all_tasks(
+            in_dir=in_dir,
+            suite_name=suite_name,
+            scheme=scheme,
+            net_cfg_list=net_cfg_list,
+            algo_cfg=algo_cfg,
+            train_cfg=train_cfg,
+            seeds=seeds,
+            device=device,
+            verbose=True,
+        )
