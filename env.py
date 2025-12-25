@@ -26,6 +26,7 @@ class CircuitDesignerDiscrete(gym.Env):
         render_mode=None,
         mode='train',
         max_qubits=4,   # 统一 one-hot 编码
+        # max_gates=10,   # 统一神经网络输入维度
         max_gates=78,   # 统一神经网络输入维度
         max_depth = 78,
         fidelity_threshold: float = 0.99,
@@ -163,7 +164,7 @@ class CircuitDesignerDiscrete(gym.Env):
         if not isinstance(target_qc, QuantumCircuit):
             raise TypeError("task_pool 中的目标需为 QuantumCircuit。")
 
-        return str(task_id), target_qc, difficulty_bin, gates_count
+        return str(task_id), target_qc, difficulty_bin, gates_count, int(active)
 
     def _sample_task(self):
         """从任务池中随机抽取一个任务"""
@@ -297,10 +298,7 @@ class CircuitDesignerDiscrete(gym.Env):
         if self.current_gates >= self.task_budget:
             return np.zeros(action_n, dtype=np.int8)
 
-        # 空电路：全部合法
-        if not self.gate_tokens:
-            return np.ones(action_n, dtype=np.int8)
-
+        # 初始化为全 1，后续逐步屏蔽
         mask = np.ones(action_n, dtype=np.int8)
 
         # 配置
@@ -311,6 +309,8 @@ class CircuitDesignerDiscrete(gym.Env):
             ('Y', 'Z'), ('Z', 'Y'),
             ('Z', 'X'), ('X', 'Z'),
         }
+        # 仅允许对“激活”的量子比特施加操作：active_n_qubits 从任务里得知
+        active_q = int(getattr(self, "active_n_qubits", self.n_qubits))
 
         def _frontier_act(q):
             """返回 qubit q 的最外层触碰门 act(dict)，若为空返回 None"""
@@ -321,6 +321,18 @@ class CircuitDesignerDiscrete(gym.Env):
 
         for idx, cand in enumerate(self.actions):
             g = cand['gate']
+
+            # -------- 阻断未激活量子比特 --------
+            if g in self.single_gates:
+                if cand['target'] >= active_q:
+                    mask[idx] = 0
+                    continue
+            elif g == 'CNOT':
+                c = cand['control']
+                t = cand['target']
+                if c >= active_q or t >= active_q:
+                    mask[idx] = 0
+                    continue
 
             # ========= A) 单比特候选 =========
             if g in self.single_gates:
@@ -370,6 +382,10 @@ class CircuitDesignerDiscrete(gym.Env):
             # 其他类型动作（若未来扩展）：默认合法
             continue
 
+        # 空电路直接返回当前屏蔽结果（需考虑未激活量子比特）
+        if not self.gate_tokens:
+            return mask
+
         return mask
 
     def reset(self, seed=None, options=None):
@@ -385,7 +401,7 @@ class CircuitDesignerDiscrete(gym.Env):
             self._np_random, _ = gym.utils.seeding.np_random(seed)
 
         # 采样任务
-        self.current_task_id, self.target_qc, self.current_difficulty_bin, self.gates_target = self._sample_task()
+        self.current_task_id, self.target_qc, self.current_difficulty_bin, self.gates_target, self.active_n_qubits = self._sample_task()
         # tianshou 的 buffer.hasnull 会把 None 视为缺失值并直接报错（MalformedBufferError）
         # 有些任务缺少 difficulty_bin，统一用字符串占位，避免 None 进入 info
         safe_diff_bin = self.current_difficulty_bin if self.current_difficulty_bin is not None else "NA"
