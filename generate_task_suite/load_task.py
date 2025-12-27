@@ -198,11 +198,11 @@ def export_all_png(tasks: List[Dict[str, Any]], out_dir: str, dpi: int = 140) ->
 # -----------------------------
 # Main
 # -----------------------------
-def main():
+def main(names: list[str]):
     suite_dir = "task_suites"
 
     # change these names to your actual suite files
-    names = ["Dev", "Val", "Eval"]  # or ["train", "test", "spare"]
+    # names = ["Final"]  # or ["train", "test", "spare"]
 
     for nm in names:
         tasks = load_task_suite(suite_dir, nm)
@@ -216,4 +216,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(names=["Final"])

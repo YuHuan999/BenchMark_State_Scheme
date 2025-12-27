@@ -1,7 +1,7 @@
 import numpy as np
 from qiskit import QuantumCircuit
 import math
-import numpy as np
+from collections import defaultdict
 # ---------------------
 # Defaults for score bins
 # ---------------------
@@ -26,7 +26,8 @@ DEFAULT_DEPTH_BINS = {}
 DEFAULT_LENGTH_BIN_PROBS = {}
 # ---------------------
 # Gate set (match env)
-# ---------------------
+
+
 SINGLE_GATES = ["X", "Y", "Z", "H", "T"]
 CANCEL_1Q = {"H", "X", "Y", "Z"}  # cancellation: 1q self-inverse
 PAULI_REDUNDANT_PAIRS = {
@@ -40,6 +41,7 @@ def action_space_size(n_qubits: int) -> int:
 
 def difficulty_score(n_qubits: int, gate_count: int) -> int:
     return int(action_space_size(n_qubits) * int(gate_count))
+
 
 def _alloc_counts(total: int, probs: dict, keys: list[str]) -> dict[str, int]:
     """按 probs 分配整数个数，保证总和=total（最大余数法）"""
@@ -152,6 +154,61 @@ def generate_tasks_by_score_distribution(
 
     rng.shuffle(tasks)
     return tasks, score_bins
+
+
+def generate_tasks_from_guidance(
+    seed: int,
+    guidance: list[list | tuple],
+    per_guidance: int = 1,
+    *,
+    max_tries: int = 200,
+    bins: dict | None = None,
+    min_gates: int = 1,
+    max_gates: int = 60,
+):
+    """
+    根据指导列表生成任务集。
+    guidance 每个元素形如 [n_qubits, gate_count, difficulty_score_hint]。
+    对于每个 guidance 生成 per_guidance 个全随机电路（不使用 action mask）。
+    返回 tasks(list) 及使用的 bins。
+    """
+    rng = np.random.default_rng(int(seed))
+    bins = bins or DEFAULT_SCORE_BINS
+    tasks = []
+    idx = 0
+    counters: dict[tuple[int, int], int] = defaultdict(int)  # (n_qubits, gate_count) -> local idx
+
+    for item in guidance:
+        if len(item) < 2:
+            raise ValueError(f"guidance item needs at least (n_qubits, gate_count), got {item}")
+        n_qubits = int(item[0])
+        gate_count_target = int(round(item[1]))
+        for _ in range(int(per_guidance)):
+            ok = False
+            for __ in range(int(max_tries)):
+                gate_count = max(min_gates, min(max_gates, gate_count_target))
+                qc = build_random_circuit_totally(n_qubits, gate_count, rng)
+                sc = float(item[2])
+                bin_name = int(sc)  # bin 用整数，score 保留小数
+                key = (n_qubits, gate_count)
+                local_id = counters[key]
+                counters[key] += 1
+                tasks.append({
+                    # 命名规则：random_<local_id>_<n_qubit>_<circuit length>_<difficulty_score_int>
+                    "task_id": f"random_{local_id}_{n_qubits}_{gate_count}_{int(sc)}",
+                    "qc": qc,
+                    "n_qubits": n_qubits,
+                    "difficulty_bin": bin_name,
+                    "target_gates": gate_count,
+                    "difficulty_score": sc,
+                })
+                idx += 1
+                ok = True
+                break
+            if not ok:
+                raise RuntimeError(f"Failed to sample task for guidance {item}")
+
+    return tasks, bins
 
 def _all_actions(n_qubits: int):
     """
@@ -698,9 +755,9 @@ def save_task_suite(out_dir: str, name: str, tasks: list[dict]) -> None:
             if "difficulty_bin" in t:
                 row["difficulty_bin"] = t["difficulty_bin"]
 
-            # Difficulty score (recommended)
+            # Difficulty score (recommended) 保留完整浮点
             if "difficulty_score" in t:
-                row["difficulty_score"] = int(t["difficulty_score"])
+                row["difficulty_score"] = float(t["difficulty_score"])
             
             if "qc_text" in t:
                 row["qc_text"] = t["qc_text"]
@@ -775,3 +832,5 @@ def load_task_suite(in_dir: str, name: str) -> list[dict]:
         tasks.append(t)
 
     return tasks
+
+    
