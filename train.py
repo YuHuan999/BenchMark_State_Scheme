@@ -1,6 +1,7 @@
 import sys
 import os
 import io
+import json
 from datetime import datetime
 from contextlib import redirect_stdout, redirect_stderr
 sys.path.insert(0, r"E:\Projects\BenchMark_state_scheme\tianshou")
@@ -602,6 +603,96 @@ def run_stage(
         "records_by_cfg": all_records_by_cfg,
     }
 
+
+
+
+def load_task_by_id(in_dir: str, suite_name: str, task_id: str) -> Dict[str, Any]:
+    """从指定任务集加载并返回单个 task（按 task_id 匹配）。"""
+    tasks = normalize_tasks(load_task_suite(in_dir, suite_name))
+    matches = [t for t in tasks if str(t.get("task_id")) == str(task_id)]
+    if not matches:
+        raise KeyError(f"task_id={task_id} not found in suite {suite_name}")
+    if len(matches) > 1:
+        print(f"[warn] found {len(matches)} tasks with task_id={task_id}, use the first one.")
+    return matches[0]
+
+
+def load_sampled_tasks_by_bin(
+    *,
+    in_dir: str,
+    suite_name: str,
+    sampled_json_path: str,
+) -> Dict[str, list]:
+    """
+    读取按 difficulty_bin 抽样得到的 ID 列表（如 Final_sampled_bin10.json），
+    返回一个大字典：bin -> [task dict...]
+    random 与 common 的任务都会被映射回完整 task。
+    """
+    tasks = normalize_tasks(load_task_suite(in_dir, suite_name))
+    id_map = {str(t.get("task_id")): t for t in tasks}
+
+    data = json.load(open(sampled_json_path, "r", encoding="utf-8"))
+    sampled_ids = data.get("sampled", {})
+
+    out: Dict[str, list] = {}
+    for bin_name, ids in sampled_ids.items():
+        out[bin_name] = []
+        for tid in ids:
+            tid_str = str(tid)
+            if tid_str not in id_map:
+                raise KeyError(f"task_id={tid_str} not found in suite {suite_name}")
+            out[bin_name].append(id_map[tid_str])
+
+    return out
+
+
+def run_task_by_id(
+    *,
+    in_dir: str,
+    suite_name: str,
+    task_id: str,
+    scheme: str,
+    net_cfg_list: list,
+    algo_cfg: dict,
+    train_cfg: dict,
+    seeds: list,
+    device: str,
+    verbose: bool = True,
+):
+    """
+    入口：指定任务集 + task_id，只运行这个任务的训练与评估。
+    用法示例：
+      run_task_by_id(
+          in_dir="task_suites",
+          suite_name="Dev",
+          task_id="task_22",
+          scheme="gate_seq",
+          net_cfg_list=[...],
+          algo_cfg=algo_cfg,
+          train_cfg=train_cfg,
+          seeds=[0],
+          device="cuda",
+      )
+    """
+    task = load_task_by_id(in_dir, suite_name, task_id)
+    all_summaries = []
+    all_records_by_cfg = {}
+    for net_cfg in net_cfg_list:
+        records, summary = run_cfg_on_taskset(
+            stage_name=suite_name,
+            tasks=[task],
+            scheme=scheme,
+            net_cfg=net_cfg,
+            algo_cfg=algo_cfg,
+            train_cfg=train_cfg,
+            device=device,
+            seeds=seeds,
+            verbose=verbose,
+        )
+        all_records_by_cfg[net_cfg.get("name", "net_cfg")] = records
+        all_summaries.append(summary)
+    return {"summaries": all_summaries, "records_by_cfg": all_records_by_cfg}
+
 def run_suite_all_tasks(
     *,
     in_dir: str,
@@ -669,166 +760,8 @@ def run_suite_all_tasks(
     }
 
 
-def load_task_by_id(in_dir: str, suite_name: str, task_id: str) -> Dict[str, Any]:
-    """从指定任务集加载并返回单个 task（按 task_id 匹配）。"""
-    tasks = normalize_tasks(load_task_suite(in_dir, suite_name))
-    matches = [t for t in tasks if str(t.get("task_id")) == str(task_id)]
-    if not matches:
-        raise KeyError(f"task_id={task_id} not found in suite {suite_name}")
-    if len(matches) > 1:
-        print(f"[warn] found {len(matches)} tasks with task_id={task_id}, use the first one.")
-    return matches[0]
-
-
-def run_task_by_id(
-    *,
-    in_dir: str,
-    suite_name: str,
-    task_id: str,
-    scheme: str,
-    net_cfg_list: list,
-    algo_cfg: dict,
-    train_cfg: dict,
-    seeds: list,
-    device: str,
-    verbose: bool = True,
-):
-    """
-    入口：指定任务集 + task_id，只运行这个任务的训练与评估。
-    用法示例：
-      run_task_by_id(
-          in_dir="task_suites",
-          suite_name="Dev",
-          task_id="task_22",
-          scheme="gate_seq",
-          net_cfg_list=[...],
-          algo_cfg=algo_cfg,
-          train_cfg=train_cfg,
-          seeds=[0],
-          device="cuda",
-      )
-    """
-    task = load_task_by_id(in_dir, suite_name, task_id)
-    all_summaries = []
-    all_records_by_cfg = {}
-    for net_cfg in net_cfg_list:
-        records, summary = run_cfg_on_taskset(
-            stage_name=suite_name,
-            tasks=[task],
-            scheme=scheme,
-            net_cfg=net_cfg,
-            algo_cfg=algo_cfg,
-            train_cfg=train_cfg,
-            device=device,
-            seeds=seeds,
-            verbose=verbose,
-        )
-        all_records_by_cfg[net_cfg.get("name", "net_cfg")] = records
-        all_summaries.append(summary)
-    return {"summaries": all_summaries, "records_by_cfg": all_records_by_cfg}
-
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    ## Dev task 第一阶段
-    in_dir = "task_suites"
-    name = "Dev"  ## Dev, Eval
-
-    dev_tasks = load_task_suite(in_dir, name)
-    dev_tasks = normalize_tasks(dev_tasks)
-
-    train_tasks = dev_tasks
-    test_tasks  = dev_tasks
-    scheme = "gate_seq"   # 你会用 argparse 切换
-    n_train_env = 8
-    n_test_env = 1
-    base_seed = 1
-
-    # 用 list comprehension，避免 [lambda]*n 的坑；并给不同 seed
-    train_envs = DummyVectorEnv([
-        (lambda i=i: (lambda: make_env(train_tasks, test_tasks, mode="train",
-                                    scheme=scheme, seed=base_seed + i)))()
-        for i in range(n_train_env)
-    ])
-    test_envs = DummyVectorEnv([
-    (lambda i=i: (lambda: make_env(train_tasks, test_tasks, mode="test",
-                                   scheme=scheme, seed=base_seed + 10_000 + i)))()
-    for i in range(n_test_env)
-    ])
-    # 从 env 拿动作维度
-    dummy = make_env(train_tasks, test_tasks, mode="train", scheme=scheme,
-                     seed=base_seed + 999)
-    act_dim = int(dummy.action_space.n)
-
-    # ---- 从 env 推断 max_gates（gate_seq 表示一般就是 state 的长度）----
-    obs0, _ = dummy.reset(seed=base_seed + 123)
-    max_gates = int(obs0["state"].shape[-1])   # e.g. 32
-
-    actions = getattr(dummy, "actions", None) or getattr(dummy.unwrapped, "actions", None)
-    if actions is None:
-        # 如果 encoder_MLP.py 里没有暴露 create_action_mapping，你就用你自己那份全局 actions
-        # 这里假设你已经固定 Nmax=4
-        from encoders.encoder_MLP import create_action_mapping
-        actions = create_action_mapping(n_qubits=4)
-
-    # ---- Encoder_MLP -> SharedMLP ----
-    encoder = Encoder_MLP(actions=actions, max_gates=max_gates, hid=256).to(device)
-    shared  = SharedMLP(in_dim=256, out_dim=256, act="silu", use_ln=True).to(device)
-
-    feat_dim = 256
-    ac = ActorCritic(encoder, shared, feat_dim=feat_dim, act_dim=act_dim).to(device)
-
-    actor  = ActorWrapper(ac)
-    critic = CriticWrapper(ac)
-    optim = AdamOptimizerFactory(lr=3e-4)
-
-    actor_policy = ProbabilisticActorPolicy(
-        actor=actor,
-        dist_fn=dist_fn,
-        action_space=dummy.action_space,
-        observation_space=dummy.observation_space,
-        action_scaling=False,
-        action_bound_method=None,
-    )
-    algorithm = PPO(
-        policy=actor_policy,
-        critic=critic,
-        optim=optim,
-        gamma=0.99,
-        gae_lambda=0.95,
-        max_grad_norm=0.5,
-        eps_clip=0.2,
-        vf_coef=0.5,
-        ent_coef=0.01, # 促进探索（Dev 很重要）
-        return_scaling=False,
-        advantage_normalization=True, # 稳定训练（Dev 很重要）
-        value_clip=False,
-    )
-
-    # on-policy buffer（大小 >= 每次收集的步数）
-    buf = VectorReplayBuffer(total_size=20000, buffer_num=n_train_env)
-    train_collector = Collector(algorithm, train_envs, buf, exploration_noise=False)
-    test_collector  = Collector(algorithm, test_envs, exploration_noise=False)
-
-    trainer_params = OnPolicyTrainerParams(
-        training_collector=train_collector,
-        test_collector=test_collector,
-
-        # Dev 粗筛：总预算先缩小（每个 trial 快）
-        max_epochs=8,
-        epoch_num_steps=10000,               # 每个 epoch 的总交互步数（越大越慢）
-        collection_step_num_env_steps=2048, # 每轮收集 rollout 步数（PPO 常用 1k~4k）
-
-        # 更新强度：先别太大，避免过拟合/不稳定
-        update_step_num_repetitions=6,      # 3~6 都行，Dev 我建议 5
-        batch_size=256,                     # 256 OK（你现在也是 256）
-
-        # Dev 测试：保留一点点信号就够了（不然 test 会占掉大量时间）
-        test_step_num_episodes=5,           # 从 20 降到 5
-        test_in_training=False,
-    )
-    result = algorithm.run_training(trainer_params)
-    print(result)
+    pass
 
 
 if __name__ == "__main__":
@@ -848,33 +781,65 @@ if __name__ == "__main__":
     # 1) network configs (baseline grid)
     #   说明：net_cfg 通过 Encoder_MLP.from_cfg + SharedMLP 共同生效
     # ----------------
-    
     net_cfg_list = [
-    # ====== Tiny / Smoke（主要看 pipeline & reward 是否有信号）======
-    # {"name": "E055k_h64_d2",  "hid": 64,  "depth": 2, "act": "silu", "use_ln": True,
-    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-
-    # # ====== Small（你现在的 128 档，建议作为“最小可用 baseline”）======
-    # {"name": "E118k_h128_d2", "hid": 128, "depth": 2, "act": "silu", "use_ln": True,
-    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-
-    # ====== Medium（通常足够覆盖 easy~hard，并开始挑战 very_hard）======
-    {"name": "E268k_h256_d2", "hid": 256, "depth": 2, "act": "silu", "use_ln": True,
+    # ====== Tiny / Smoke ======
+    {"name": "E055k_h64_d2",
+     "hid": 64, "depth": 2,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
      "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-    # # ====== Medium+（更“深”而不是更“宽”，对你这种 token-onehot+flatten 的任务往往更划算）======
-    {"name": "E334k_h256_d3", "hid": 256, "depth": 3, "act": "silu", "use_ln": True,
+    # ====== Small ======
+    {"name": "E118k_h128_d2",
+     "hid": 128, "depth": 2,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
      "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-    # # ====== Large（开始针对接近你设定的最难阈值那一档）======
-    {"name": "E451k_h384_d2", "hid": 384, "depth": 2, "act": "silu", "use_ln": True,
+    # ====== Medium ======
+    {"name": "E268k_h256_d2",
+     "hid": 256, "depth": 2,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
      "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-    # # ====== XL（只有当 Large 仍明显不够时再开；否则很浪费预算）======
-    {"name": "E667k_h512_d2", "hid": 512, "depth": 2, "act": "silu", "use_ln": True,
+    # ====== Depth control (only one) ======
+    {"name": "E334k_h256_d3",
+     "hid": 256, "depth": 3,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
      "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-    ]
-        
+
+    # ====== Large ======
+    {"name": "E451k_h384_d2",
+     "hid": 384, "depth": 2,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # ====== XXL ======
+    {"name": "E599k_h384_d3",
+     "hid": 384, "depth": 3,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+    
+    # ====== XL ======
+    {"name": "E667k_h512_d2",
+     "hid": 512, "depth": 2,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # ====== XXL ======
+    {"name": "E930k_h512_d3",
+     "hid": 512, "depth": 3,
+     "act": "silu", "use_ln": True,
+     "dropout": 0.0, "input_dropout": 0.0,
+     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+    
+     ]
+    
             
 
     # ----------------
@@ -908,18 +873,18 @@ if __name__ == "__main__":
         "eval_episodes": 1,
 
         # PPO rollout / update 强度：先保守，稳定优先
-        "collect_steps": 1024,
-        "update_reps": 4,
+        "collect_steps": 2048,
+        "update_reps": 8,
         "batch_size": 256,
 
         # buffer_size 只是下限，代码里会用 max(buffer_size, this_chunk*2) 兜底
         "buffer_size": 20000,
 
         # 需要的话你也能显式写死阈值（否则从 env 里读）
-        "fidelity_threshold": 0.9,
+        "fidelity_threshold": 0.95,
 
         # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
-        "max_gates": 14,
+        "max_gates": 20,  ##最大14 1.4* 14 = 20
 
         # 评估成功后直接提前停掉，节省预算
         "early_stop_on_success": True,
@@ -930,7 +895,7 @@ if __name__ == "__main__":
     # ----------------
     # 4) seeds（先 smoke：1 个；跑 baseline：2~3 个）
     # ----------------
-    seeds = [0, 1, 2] 
+    seeds = [0, 1, 2, 3, 4] 
 
     # ----------------
     # 5) 日志：stdout/stderr 同时写到文件，便于后续查看
