@@ -1,5 +1,6 @@
 import numpy as np
 import gymnasium as gym
+import time
 from gymnasium.envs.registration import register
 
 from qiskit import QuantumCircuit
@@ -57,6 +58,13 @@ class CircuitDesignerDiscrete(gym.Env):
         self.success_reward = success_reward
         self.fail_reward = fail_reward
         self.gates_penalty = gates_penalty
+        self.profile = {
+            "env_step_time": 0.0,
+            "env_step_calls": 0,
+            "illegal_count": 0,
+            "mask_valid_sum": 0.0,
+            "mask_calls": 0,
+        }
         
 
         self._qc = QuantumCircuit(self.n_qubits)
@@ -89,12 +97,14 @@ class CircuitDesignerDiscrete(gym.Env):
         self.action_space = gym.spaces.Discrete(len(self.actions))
 
         # 观察空间：定长门序列，padding=-1
-        self.observation_space = gym.spaces.Box(
+        state_space = gym.spaces.Box(
             low=-1,
             high=len(self.actions) - 1,
             shape=(self.max_gates,),
             dtype=np.int32,
         )
+        mask_space = gym.spaces.MultiBinary(len(self.actions))
+        self.observation_space = gym.spaces.Dict({"state": state_space, "action_mask": mask_space})
 
         print(f"Created {len(self.actions)} discrete actions")
 
@@ -266,12 +276,13 @@ class CircuitDesignerDiscrete(gym.Env):
         return float(improvement)
 
     def _observation(self):
-        """返回定长门序列，未使用的槽位填充为 -1。"""
-        obs = np.full(self.max_gates, -1, dtype=np.int32)
+        """返回 dict obs：state=定长门序列(action id, padding=-1)，附带 action_mask。"""
+        state = np.full(self.max_gates, -1, dtype=np.int32)
         if self.gate_tokens:
             L = min(len(self.gate_tokens), self.max_gates)
-            obs[:L] = np.array(self.gate_tokens[:L], dtype=np.int32)
-        return obs
+            state[:L] = np.array(self.gate_tokens[:L], dtype=np.int32)
+        mask = self._action_mask()
+        return {"state": state, "action_mask": mask}
 
     def _action_mask(self):
         """
@@ -442,11 +453,13 @@ class CircuitDesignerDiscrete(gym.Env):
             "task_id": self.current_task_id,
             "n_qubits": int(self.n_qubits),
             "difficulty_bin": safe_diff_bin,
-            "action_mask": self._action_mask(),
+            "action_mask": obs["action_mask"],
+            "valid_action_ratio": float(np.mean(obs["action_mask"])) if obs["action_mask"].size > 0 else 0.0,
         }
         return obs, info
 
     def step(self, action_id):
+        t0 = time.perf_counter()
         # prev_fidelity
         if len(self.fidelities) == 0:
             prev_fidelity = float(self._compute_fidelity())
@@ -456,29 +469,54 @@ class CircuitDesignerDiscrete(gym.Env):
 
         # mask for current state
         mask = self._action_mask()
+        mask_ratio = float(np.mean(mask)) if mask.size > 0 else 0.0
+        self.profile["mask_valid_sum"] += mask_ratio
+        self.profile["mask_calls"] += 1
 
         aid = -1 if action_id is None else int(action_id)
-
-        def _raise_illegal(reason: str):
-            raise ValueError(
-                f"Illegal action: {reason}. "
-                f"action_id={action_id}, aid={aid}, "
-                f"mask_sum={int(mask.sum())}, "
-                f"len_actions={len(self.actions)}, "
-                f"gates={self.current_gates}, depth={self.current_depth}, "
-                f"task_id={self.current_task_id}"
-            )
+        illegal = False
+        illegal_reason = None
 
         if action_id is None:
-            _raise_illegal("action is None")
-        if aid < 0 or aid >= len(self.actions):
-            _raise_illegal("action id out of range")
-        if mask[aid] == 0:
-            _raise_illegal("action is masked out (illegal)")
+            illegal = True
+            illegal_reason = "action is None"
+        elif aid < 0 or aid >= len(self.actions):
+            illegal = True
+            illegal_reason = "action id out of range"
+        elif mask[aid] == 0:
+            illegal = True
+            illegal_reason = "action is masked out (illegal)"
 
-        operation = self._operation(aid)
-        if operation is None:
-            _raise_illegal("operation lookup returned None")
+        operation = None if illegal else self._operation(aid)
+        if not illegal and operation is None:
+            illegal = True
+            illegal_reason = "operation lookup returned None"
+
+        if illegal:
+            self.profile["illegal_count"] += 1
+            obs = self._observation()
+            mask_next = obs["action_mask"]
+            safe_diff_bin = self.current_difficulty_bin if self.current_difficulty_bin is not None else "NA"
+            info = {
+                "fidelity": float(self.fidelities[-1]) if self.fidelities else 0.0,
+                "step_count": len(self.gate_tokens),
+                "gate_count": int(self.current_gates),
+                "task_id": self.current_task_id,
+                "n_qubits": self.n_qubits,
+                "difficulty_bin": safe_diff_bin,
+                "depth": int(self.current_depth),
+                "action_mask": mask_next,
+                "reached_max_depth": False,
+                "reached_budget": False,
+                "illegal_action": True,
+                "illegal": True,
+                "illegal_reason": illegal_reason,
+                "valid_action_ratio": float(np.mean(mask_next)) if mask_next.size > 0 else 0.0,
+            }
+            self.profile["env_step_time"] += time.perf_counter() - t0
+            self.profile["env_step_calls"] += 1
+            # 非法动作：给予 fail_reward，截断本 episode 避免无限循环
+            return obs, float(self.fail_reward), False, True, info
 
         self._qc.append(*operation)
         self.gate_tokens.append(aid)
@@ -515,7 +553,7 @@ class CircuitDesignerDiscrete(gym.Env):
         ))
 
         obs = self._observation()
-        mask_next = self._action_mask()
+        mask_next = obs["action_mask"]
         safe_diff_bin = self.current_difficulty_bin if self.current_difficulty_bin is not None else "NA"
         info = {
             "fidelity": fidelity,
@@ -528,7 +566,9 @@ class CircuitDesignerDiscrete(gym.Env):
             "action_mask": mask_next,
             "reached_max_depth": bool(reached_max_depth),
             "reached_budget": bool(reached_budget),
-            "illegal_action": False,  # 若有非法动作会在前面直接抛错
+            "illegal_action": False,
+            "illegal": False,
+            "valid_action_ratio": float(np.mean(mask_next)) if mask_next.size > 0 else 0.0,
         }
 
         self.fidelities.append(fidelity)
@@ -537,7 +577,23 @@ class CircuitDesignerDiscrete(gym.Env):
         if getattr(self, "debug", False):
             assert len(self.gate_tokens) == len(self._qc.data), "gate_tokens 与 qc.data 长度不一致"
 
+        self.profile["env_step_time"] += time.perf_counter() - t0
+        self.profile["env_step_calls"] += 1
+
         return obs, reward, terminated, truncated, info
+
+    def get_circuit_stats(self):
+        """返回当前电路的统计信息，用于日志/排名。"""
+        gate_count = len(self._qc.data)
+        depth = int(self._qc.depth())
+        cx_count = sum(1 for inst, _, _ in self._qc.data if isinstance(inst, CXGate))
+        oneq_count = gate_count - cx_count
+        return {
+            "gate_count": int(gate_count),
+            "depth": depth,
+            "cx_count": int(cx_count),
+            "oneq_count": int(oneq_count),
+        }
 
     def render(self):
         """渲染当前电路"""

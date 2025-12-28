@@ -21,8 +21,10 @@ class RepresentationWrapper(gym.Wrapper):
 
     def _to_representation(self, canonical_obs, info):
         """canonical_obs -> rep_state"""
+        # canonical_obs 可能是 dict({"state": ..., "action_mask": ...}) 或原始数组
+        base_state = canonical_obs["state"] if isinstance(canonical_obs, dict) and "state" in canonical_obs else canonical_obs
         if self.scheme == "gate_seq":
-            return canonical_obs
+            return base_state
 
         elif self.scheme == "2d_grid":
             return self._build_2d_grid(canonical_obs, info)

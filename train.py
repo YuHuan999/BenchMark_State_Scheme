@@ -14,7 +14,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import time
+from torch.utils.tensorboard import SummaryWriter
 from torch.distributions import Categorical
+import subprocess
+from collections import defaultdict
 from qiskit import QuantumCircuit
 
 from tianshou.env import DummyVectorEnv
@@ -32,6 +35,60 @@ from encoders.encoder_MLP import Encoder_MLP
 from typing import Dict, List, Tuple, Any
 
 DEFAULT_BINS_ORDER = ["easy", "medium", "hard", "very_hard", "extreme"]
+
+
+class RunLogger:
+    """轻量级训练日志器：config/metrics/summary + TensorBoard."""
+
+    def __init__(self, root_log_dir: str, scheme: str, stage_name: str, net_cfg_name: str, task_id: str, seed: int):
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.run_dir = os.path.join(
+            root_log_dir,
+            str(stage_name),
+            str(scheme),
+            str(net_cfg_name),
+            str(task_id),
+            f"seed_{seed}",
+            f"run_{ts}",
+        )
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.tb_dir = os.path.join(self.run_dir, "tb")
+        self.metrics_path = os.path.join(self.run_dir, "metrics.jsonl")
+        self.config_path = os.path.join(self.run_dir, "config.json")
+        self.summary_path = os.path.join(self.run_dir, "summary.json")
+        self.writer = SummaryWriter(self.tb_dir)
+
+    def _flatten(self, data: dict, prefix: str = ""):
+        for k, v in data.items():
+            key = f"{prefix}/{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                yield from self._flatten(v, key)
+            else:
+                yield key, v
+
+    def log_config(self, cfg: dict):
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    def log_metrics(self, step: int, metrics: dict):
+        line = {"step": int(step), "timestamp": time.time()}
+        line.update(metrics)
+        with open(self.metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+        for k, v in self._flatten(metrics):
+            if isinstance(v, (int, float)) and np.isfinite(v):
+                self.writer.add_scalar(k, float(v), global_step=int(step))
+
+    def log_summary(self, summary: dict):
+        with open(self.summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    def close(self):
+        if hasattr(self, "writer") and self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
+            self.writer = None
 
 def normalize_tasks(tasks):
     # 你的 Prepare_tasks.py 用 target_qc；env 里建议你最终能读到 qc 或你在 env 里兼容 target_qc
@@ -121,9 +178,15 @@ class ActorWrapper(nn.Module):
     def __init__(self, ac: ActorCritic):
         super().__init__()
         self.ac = ac
+        self.infer_time_total = 0.0
+        self.infer_calls = 0
 
     def forward(self, obs, state=None, info=None):
-        return self.ac.forward_actor(obs, state=state, info=info)
+        t0 = time.perf_counter()
+        logits = self.ac.forward_actor(obs, state=state, info=info)
+        self.infer_time_total += time.perf_counter() - t0
+        self.infer_calls += 1
+        return logits
 
 class CriticWrapper(nn.Module):
     def __init__(self, ac: ActorCritic):
@@ -178,10 +241,9 @@ def sample_tasks(tasks: List[Dict[str, Any]],
     }
     return selected_tasks, summary
 
-def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
+def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
     """
-    单任务从零训练 PPO，并在训练过程中定期评估，返回 metrics:
-      solved, steps_to_solve, best_fidelity, final_fidelity, wall_time_sec
+    单任务从零训练 PPO，输出可复现的 run 目录与诊断指标。
     """
 
     # -----------------------
@@ -193,18 +255,19 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         torch.cuda.manual_seed_all(seed)
 
     t0 = time.time()
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # -----------------------
     # 1) 固定为单任务池（关键）
     # -----------------------
     train_tasks = [task]
-    test_tasks  = [task]
+    test_tasks = [task]
 
     n_train_env = int(train_cfg["n_train_env"])
     total_budget_steps = int(train_cfg["total_budget_steps"])
-    eval_every_steps   = int(train_cfg["eval_every_steps"])   # 例如 10000
-    eval_episodes      = int(train_cfg["eval_episodes"])      # 例如 1~3（Dev）/ 3~5（Val）
-    buffer_size        = int(train_cfg["buffer_size"])
+    eval_every_steps = int(train_cfg["eval_every_steps"])   # 例如 10000
+    eval_episodes = int(train_cfg["eval_episodes"])      # 例如 number of eval episodes
+    buffer_size = int(train_cfg["buffer_size"])
 
     # -----------------------
     # 2) 构建并行训练 env（同一个任务，不同 seed）
@@ -247,8 +310,7 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
 
     actions = getattr(dummy, "actions", None) or getattr(dummy.unwrapped, "actions", None)
     if actions is None:
-        from encoders.encoder_MLP import create_action_mapping
-        actions = create_action_mapping(n_qubits=4)
+        raise RuntimeError("env must provide actions mapping (dummy.actions or dummy.unwrapped.actions)")
 
     fidelity_threshold = float(getattr(dummy.unwrapped, "fidelity_threshold", 0.99))
 
@@ -256,16 +318,16 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
     # 3) build network（只依赖 net_cfg）
     # -----------------------
     encoder = Encoder_MLP.from_cfg(actions=actions, max_gates=max_gates, cfg=net_cfg).to(device)
-    enc_out = int(getattr(encoder, "out_dim", net_cfg.get("hid", 256)))
+    enc_out = int(getattr(encoder, "out_dim", net_cfg.get("out_dim", 256)))
     use_ln = bool(net_cfg.get("use_ln", True))
     shared_act = str(net_cfg.get("shared_act", "silu"))
     shared_out = int(net_cfg.get("shared_out_dim", enc_out))
 
-    shared  = SharedMLP(in_dim=enc_out, out_dim=shared_out, act=shared_act, use_ln=use_ln).to(device)
+    shared = SharedMLP(in_dim=enc_out, out_dim=shared_out, act=shared_act, use_ln=use_ln).to(device)
 
     feat_dim = shared_out
     ac = ActorCritic(encoder, shared, feat_dim=feat_dim, act_dim=act_dim).to(device)
-    actor  = ActorWrapper(ac)
+    actor = ActorWrapper(ac)
     critic = CriticWrapper(ac)
 
     # -----------------------
@@ -297,9 +359,94 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         advantage_normalization=bool(algo_cfg.get("advantage_normalization", True)),
         value_clip=bool(algo_cfg.get("value_clip", False)),
     )
+    
+    algorithm.profile_update_time = 0.0
+    algorithm.profile_update_calls = 0
+    algorithm.profile_ppo_stats_sum = defaultdict(float)
+    algorithm.profile_ppo_stats_n = 0
+    orig_update = algorithm.update
+
+    def _acc_stat(res_dict, aliases, key):
+        for k in aliases:
+            if k in res_dict and res_dict[k] is not None:
+                try:
+                    v = float(res_dict[k])
+                    algorithm.profile_ppo_stats_sum[key] += v
+                except Exception:
+                    pass
+                break
+
+    def wrapped_update(*args, **kwargs):
+        t_start = time.perf_counter()
+        res = orig_update(*args, **kwargs)
+        algorithm.profile_update_time += time.perf_counter() - t_start
+        algorithm.profile_update_calls += 1
+
+        res_dict = None
+        if isinstance(res, dict):
+            res_dict = res
+        elif hasattr(res, "__dict__") and isinstance(res.__dict__, dict):
+            res_dict = res.__dict__
+
+        if res_dict is not None:
+            algorithm.profile_ppo_stats_n += 1
+            _acc_stat(res_dict, ["approx_kl", "kl", "policy_kl", "train/approx_kl"], "approx_kl")
+            _acc_stat(res_dict, ["clipfrac", "clip_frac", "policy_clipfrac"], "clipfrac")
+            _acc_stat(res_dict, ["entropy", "ent", "policy_entropy"], "entropy")
+            _acc_stat(res_dict, ["loss", "total_loss"], "loss_total")
+            _acc_stat(res_dict, ["actor_loss", "pi_loss"], "loss_actor")
+            _acc_stat(res_dict, ["critic_loss", "vf_loss"], "loss_critic")
+        return res
+
+    algorithm.update = wrapped_update
 
     # -----------------------
-    # 5) 评估函数：greedy(argmax)（稳定，适合比较超参）
+    # 5) 日志器（每个 run 写 config/metrics/summary + TB）
+    # -----------------------
+    log_root = train_cfg.get("log_dir", "logs")
+    task_id = task.get("task_id", None) or task.get("id", "task")
+    logger = RunLogger(
+        root_log_dir=log_root,
+        scheme=scheme,
+        stage_name=stage_name,
+        net_cfg_name=net_cfg.get("name", "net_cfg"),
+        task_id=task_id,
+        seed=seed,
+    )
+
+    # 记录 config 快照（一次性）
+    config_snapshot = {
+        "run_id": run_id,
+        "stage": stage_name, ## suite name
+        "scheme": scheme,
+        "task_id": task.get("task_id", None),
+        "difficulty_bin": task.get("difficulty_bin", None),
+        "seed": int(seed),
+        "net_cfg": net_cfg,
+        "algo_cfg": algo_cfg,
+        "train_cfg": train_cfg,
+        "device": device,
+        "act_dim": act_dim,
+        "max_gates": max_gates,
+        "fidelity_threshold": fidelity_threshold,
+        "actions": actions,
+        "python_version": sys.version,
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda if hasattr(torch.version, "cuda") else None,
+        "tianshou_module_path": getattr(sys.modules.get(PPO.__module__, None), "__file__", None),
+        "git_commit": None,
+        "seed_everything": int(seed),
+    }
+    try:
+        git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.getcwd()).decode().strip()
+        config_snapshot["git_commit"] = git_commit
+    except Exception:
+        pass
+    logger.log_config(config_snapshot)  # 配置/指纹快照
+
+    # -----------------------
+    # 6) 评估函数：greedy(argmax)（稳定，适合比较超参）
     # -----------------------
     @torch.no_grad()
     def greedy_eval():
@@ -307,19 +454,53 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
         succ = 0
         fids = []
         best_qasm = None
+        best_stats = None
+        mask_ratios = []
+        illegal_cnt = 0
+        total_steps = 0
+        ep_times = []
+        ep_steps = []
+        entropies = []
+        p_max_list = []
+        margin_list = []
+        k_eff_list = []
         for ep in range(eval_episodes):
+            ep_t0 = time.perf_counter()
             obs, info = eval_env.reset(seed=seed + 20_000 + ep)
             done = False
             last_info = info
             while not done:
                 obs_b = {
                     "state": np.expand_dims(obs["state"], axis=0),
-                    "action_mask":  np.expand_dims(obs["action_mask"], axis=0) if "action_mask" in obs else None,
+                    "action_mask": np.expand_dims(obs["action_mask"], axis=0) if "action_mask" in obs else None,
                 }
                 logits, _ = actor(obs_b)
+                probs = torch.softmax(logits[0], dim=-1)
+                p_sorted = torch.sort(probs, descending=True).values
+                p_max = float(p_sorted[0].item())
+                p_max_list.append(p_max)
+                if p_sorted.numel() > 1:
+                    margin = float((p_sorted[0] - p_sorted[1]).item())
+                else:
+                    margin = 0.0
+                margin_list.append(margin)
+                entropy = float(Categorical(logits=logits[0]).entropy().item())
+                entropies.append(entropy)
+                k_eff = float(1.0 / max(1e-12, torch.sum(probs * probs).item()))
+                k_eff_list.append(k_eff)
+
                 a = int(torch.argmax(logits[0]).item())
                 obs, r, terminated, truncated, last_info = eval_env.step(a)
                 done = bool(terminated or truncated)
+                mask_eval = last_info.get("action_mask", None) if isinstance(last_info, dict) else None
+                if mask_eval is not None:
+                    mask_ratios.append(float(np.mean(mask_eval)))
+                if isinstance(last_info, dict) and last_info.get("illegal", False):
+                    illegal_cnt += 1
+                total_steps += 1
+
+            ep_steps.append(int(last_info.get("step_count", len(getattr(eval_env, "gate_tokens", [])))))
+            ep_times.append(time.perf_counter() - ep_t0)
 
             F = float(last_info.get("fidelity", 0.0))
             fids.append(F)
@@ -330,21 +511,48 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
                     best_qasm = eval_env._qc.qasm()  # noqa: SLF001
                 except Exception:
                     best_qasm = None
-        return succ, float(np.mean(fids)) if fids else 0.0, best_qasm
+                try:
+                    best_stats = eval_env.get_circuit_stats()
+                except Exception:
+                    best_stats = None
+        mask_ratio_mean = float(np.mean(mask_ratios)) if mask_ratios else 0.0
+        illegal_rate = float(illegal_cnt) / max(1, total_steps)
+        mean_ep_time = float(np.mean(ep_times)) if ep_times else 0.0
+        mean_ep_steps = float(np.mean(ep_steps)) if ep_steps else 0.0
+        entropy_mean = float(np.mean(entropies)) if entropies else 0.0
+        p_max_mean = float(np.mean(p_max_list)) if p_max_list else 0.0
+        margin_mean = float(np.mean(margin_list)) if margin_list else 0.0
+        k_eff_mean = float(np.mean(k_eff_list)) if k_eff_list else 0.0
+        return (
+            succ,
+            float(np.mean(fids)) if fids else 0.0,
+            best_qasm,
+            best_stats,
+            mask_ratio_mean,
+            illegal_rate,
+            mean_ep_time,
+            mean_ep_steps,
+            entropy_mean,
+            p_max_mean,
+            margin_mean,
+            k_eff_mean,
+        )
 
     # -----------------------
-    # 6) 训练循环：每 eval_every_steps 训练一次 + 评估一次
+    # 7) 训练循环：每 eval_every_steps 训练一次 + 评估一次
     #    => steps_to_solve 粒度就是 eval_every_steps
     # -----------------------
     collect_steps = int(train_cfg.get("collect_steps", 2048))
-    update_reps   = int(train_cfg.get("update_reps", 6))
-    batch_size    = int(train_cfg.get("batch_size", 256))
+    update_reps = int(train_cfg.get("update_reps", 6))
+    batch_size = int(train_cfg.get("batch_size", 256))
 
     solved = False
     steps_to_solve = None
     best_fidelity = -1.0
     final_fidelity = -1.0
-    t_solve = None
+    best_stats_global = None
+    best_qasm_global = None
+    t_solve = None  # 记录首次成功（解出目标）的耗时
     solved_qasm = None
     # 记录目标电路的 qasm 便于对比
     target_qasm = None
@@ -357,78 +565,258 @@ def run_one_task(task, *, scheme, net_cfg, algo_cfg, train_cfg, device, seed=0):
 
     trained = 0
     consecutive_successes = 0  # 连续成功的评估次数
-    while trained < total_budget_steps:
-        this_chunk = min(eval_every_steps, total_budget_steps - trained)
 
-        # 进度提示：架构/任务/seed + 已完成比例
-        pct = 100.0 * trained / float(total_budget_steps)
-        print(
-            f"[train] cfg={net_cfg.get('name','net')} task={task.get('task_id')} "
-            f"seed={seed} progress={trained}/{total_budget_steps} ({pct:.1f}%)"
-        )
+    # profile 累积器（用差分得到“本 chunk”均值）
+    def _env_profile_snapshot():
+        stats = dict(env_step_time=0.0, env_step_calls=0, illegal_count=0, mask_valid_sum=0.0, mask_calls=0)
+        for e in getattr(train_envs, "envs", []):
+            prof = getattr(e, "profile", None)
+            if not prof:
+                continue
+            stats["env_step_time"] += float(prof.get("env_step_time", 0.0))
+            stats["env_step_calls"] += int(prof.get("env_step_calls", 0))
+            stats["illegal_count"] += int(prof.get("illegal_count", 0))
+            stats["mask_valid_sum"] += float(prof.get("mask_valid_sum", 0.0))
+            stats["mask_calls"] += int(prof.get("mask_calls", 0))
+        return stats
 
-        # on-policy：每 chunk 用干净的 buffer（最简单可靠）
-        buf = VectorReplayBuffer(total_size=max(buffer_size, this_chunk * 2), buffer_num=n_train_env)
-        train_collector = Collector(algorithm, train_envs, buf, exploration_noise=False)
+    prev_env_prof = _env_profile_snapshot()
+    prev_infer_time = actor.infer_time_total
+    prev_infer_calls = actor.infer_calls
+    prev_update_time = algorithm.profile_update_time
+    prev_update_calls = algorithm.profile_update_calls
+    prev_ppo_n = algorithm.profile_ppo_stats_n
+    prev_ppo_sum = defaultdict(float)
+    mean_episode_time = 0.0
+    last_entropy_mean = 0.0
+    last_p_max_mean = 0.0
+    last_margin_mean = 0.0
+    last_k_eff_mean = 0.0
 
-        trainer_params = OnPolicyTrainerParams(
-            training_collector=train_collector,
-            test_collector=None,  # 我们不用 test_collector，自己 greedy_eval 更稳定
-            max_epochs=1,
-            epoch_num_steps=int(this_chunk),
-            collection_step_num_env_steps=collect_steps,
-            update_step_num_repetitions=update_reps,
-            batch_size=batch_size,
-            test_step_num_episodes=0,
-            test_in_training=False,
-        )
-
-        algorithm.run_training(trainer_params)
-        trained += this_chunk
-
-        # 评估
-        succ, mean_F, solved_qasm_candidate = greedy_eval()
-        final_fidelity = mean_F
-        best_fidelity = max(best_fidelity, mean_F)
-
-        if (not solved) and succ > 0:
-            solved = True
-            steps_to_solve = trained
-            t_solve = time.time() - t0   # 第一次成功的耗时
-            if solved_qasm is None:
-                solved_qasm = solved_qasm_candidate
-        # 连续成功计数（用于更稳健的提前停止）
-        if succ > 0:
-            consecutive_successes += 1
-        else:
-            consecutive_successes = 0
-
-        if early_stop_on_success and consecutive_successes >= early_stop_consecutive:
-            break
-
-    wall_time = time.time() - t0
-
-    # 清理
     try:
-        train_envs.close()
-        eval_env.close()
-    except Exception:
-        pass
+        while trained < total_budget_steps:
+            this_chunk = min(eval_every_steps, total_budget_steps - trained)
 
-    return {
-        "task_id": task.get("task_id", None),
-        "difficulty_bin": task.get("difficulty_bin", None),
-        "seed": int(seed),
-        "budget_steps": int(total_budget_steps),
-        "solved": int(solved),
-        "steps_to_solve": (int(steps_to_solve) if steps_to_solve is not None else None),
-        "best_fidelity": float(best_fidelity),
-        "final_fidelity": float(final_fidelity),
-        "wall_time_sec": float(wall_time),
-        "time_to_solve_sec": float(t_solve) if t_solve is not None else wall_time * 10,
-        "solved_qasm": solved_qasm,
-        "target_qasm": target_qasm,
-    }
+            # 进度提示：架构/任务/seed + 已完成比例
+            pct = 100.0 * trained / float(total_budget_steps)
+            print(
+                f"[train] cfg={net_cfg.get('name','net')} task={task.get('task_id')} "
+                f"seed={seed} progress={trained}/{total_budget_steps} ({pct:.1f}%)"
+            )
+
+            # on-policy：每 chunk 用干净的 buffer（最简单可靠）
+            buf = VectorReplayBuffer(total_size=max(buffer_size, this_chunk * 2), buffer_num=n_train_env)
+            train_collector = Collector(algorithm, train_envs, buf, exploration_noise=False)
+
+            trainer_params = OnPolicyTrainerParams(
+                training_collector=train_collector,
+                test_collector=None,  # 我们不用 test_collector，自己 greedy_eval 更稳定
+                max_epochs=1,
+                epoch_num_steps=int(this_chunk),
+                collection_step_num_env_steps=collect_steps,
+                update_step_num_repetitions=update_reps,
+                batch_size=batch_size,
+                test_step_num_episodes=0,
+                test_in_training=False,
+            )
+
+            t_train_start = time.perf_counter()
+            algorithm.run_training(trainer_params)
+            train_chunk_time = time.perf_counter() - t_train_start
+            trained += this_chunk
+
+            # 评估
+            t_eval_start = time.perf_counter()
+            (
+                succ,
+                mean_F,
+                solved_qasm_candidate,
+                best_stats_candidate,
+                mask_ratio_mean,
+                illegal_rate_eval,
+                mean_ep_time_eval,
+                mean_ep_steps_eval,
+                entropy_mean_eval,
+                p_max_mean_eval,
+                margin_mean_eval,
+                k_eff_mean_eval,
+            ) = greedy_eval()
+            eval_time = time.perf_counter() - t_eval_start
+            final_fidelity = mean_F
+            best_fidelity = max(best_fidelity, mean_F)
+            mean_episode_time = mean_ep_time_eval
+            last_entropy_mean = entropy_mean_eval
+            last_p_max_mean = p_max_mean_eval
+            last_margin_mean = margin_mean_eval
+            last_k_eff_mean = k_eff_mean_eval
+
+            if (not solved) and succ > 0:
+                solved = True
+                steps_to_solve = trained
+                t_solve = time.time() - t0   # 第一次成功的耗时
+                if solved_qasm is None:
+                    solved_qasm = solved_qasm_candidate
+            # 连续成功计数（用于更稳健的提前停止）
+            if succ > 0:
+                consecutive_successes += 1
+            else:
+                consecutive_successes = 0
+
+            if succ > 0 and best_stats_candidate is not None:
+                best_stats_global = best_stats_candidate
+                best_qasm_global = solved_qasm_candidate
+
+            # profile 增量
+            env_prof = _env_profile_snapshot()
+            delta_env_step_time = env_prof["env_step_time"] - prev_env_prof["env_step_time"]
+            delta_env_calls = env_prof["env_step_calls"] - prev_env_prof["env_step_calls"]
+            delta_illegal = env_prof["illegal_count"] - prev_env_prof["illegal_count"]
+            delta_mask_sum = env_prof["mask_valid_sum"] - prev_env_prof["mask_valid_sum"]
+            delta_mask_calls = env_prof["mask_calls"] - prev_env_prof["mask_calls"]
+            prev_env_prof = env_prof
+
+            delta_infer_time = actor.infer_time_total - prev_infer_time
+            delta_infer_calls = actor.infer_calls - prev_infer_calls
+            prev_infer_time = actor.infer_time_total
+            prev_infer_calls = actor.infer_calls
+
+            delta_update_time = algorithm.profile_update_time - prev_update_time
+            delta_update_calls = algorithm.profile_update_calls - prev_update_calls
+            prev_update_time = algorithm.profile_update_time
+            prev_update_calls = algorithm.profile_update_calls
+            delta_ppo_n = algorithm.profile_ppo_stats_n - prev_ppo_n
+            ppo_means = {}
+            if delta_ppo_n > 0:
+                for k, v in algorithm.profile_ppo_stats_sum.items():
+                    mean_v = (v - prev_ppo_sum.get(k, 0.0)) / delta_ppo_n
+                    ppo_means[k] = mean_v
+                prev_ppo_n = algorithm.profile_ppo_stats_n
+                prev_ppo_sum = algorithm.profile_ppo_stats_sum.copy()
+
+            steps_per_sec = this_chunk / train_chunk_time if train_chunk_time > 0 else 0.0
+            env_step_time_avg = delta_env_step_time / max(1, delta_env_calls)
+            policy_infer_time_avg = delta_infer_time / max(1, delta_infer_calls)
+            update_time_avg = delta_update_time / max(1, delta_update_calls)
+            valid_action_ratio = delta_mask_sum / max(1, delta_mask_calls)
+            illegal_action_rate = delta_illegal / max(1, delta_env_calls)
+            train_accounted = delta_env_step_time + delta_infer_time + delta_update_time
+            time_accounting_coverage_train = train_accounted / max(1e-9, train_chunk_time)
+            time_frac_env = delta_env_step_time / train_chunk_time if train_chunk_time > 0 else 0.0
+            time_frac_infer = delta_infer_time / train_chunk_time if train_chunk_time > 0 else 0.0
+            time_frac_update = delta_update_time / train_chunk_time if train_chunk_time > 0 else 0.0
+
+            sys_metrics = {}
+            if torch.cuda.is_available():
+                alloc = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                resv = torch.cuda.max_memory_reserved() / (1024 ** 2)
+                sys_metrics["gpu_max_mem_allocated_mb"] = alloc
+                sys_metrics["gpu_max_mem_reserved_mb"] = resv
+                torch.cuda.reset_peak_memory_stats()
+
+            circuit_stats_log = best_stats_candidate or best_stats_global or {}
+
+            # metrics.jsonl/TB：本 chunk 统计
+            metrics = {
+                "trained_steps": trained,
+                "eval": {  # 本次评估结果（行为 + 性能）
+                    "success": succ,
+                    "mean_fidelity": mean_F,
+                    "best_fidelity_so_far": best_fidelity,
+                    "best_qasm_available": best_qasm_global is not None,
+                    "mask_valid_ratio": mask_ratio_mean,
+                    "illegal_rate": illegal_rate_eval,
+                    "mean_episode_time_sec": mean_ep_time_eval,
+                    "mean_episode_steps": mean_ep_steps_eval,
+                    "entropy_mean": entropy_mean_eval,
+                    "p_max_mean": p_max_mean_eval,
+                    "margin_mean": margin_mean_eval,
+                    "k_eff_mean": k_eff_mean_eval,
+                },
+                "circuit": {  # 最优电路结构
+                    "gate_count": circuit_stats_log.get("gate_count"),
+                    "depth": circuit_stats_log.get("depth"),
+                    "cx_count": circuit_stats_log.get("cx_count"),
+                    "oneq_count": circuit_stats_log.get("oneq_count"),
+                },
+                "time": {  # 本 chunk 训练/评估耗时
+                    "train_chunk_sec": train_chunk_time,
+                    "eval_sec": eval_time,
+                },
+                "perf": {  # 性能与时间拆解
+                    "steps_per_sec": steps_per_sec,
+                    "env_step_time_avg_sec": env_step_time_avg,
+                    "policy_infer_time_avg_sec": policy_infer_time_avg,
+                    "update_time_avg_sec": update_time_avg,
+                    "time_accounting_coverage_train": time_accounting_coverage_train,
+                    "time_frac_env": time_frac_env,
+                    "time_frac_infer": time_frac_infer,
+                    "time_frac_update": time_frac_update,
+                },
+                "mask": {  # 合法性/非法率
+                    "valid_action_ratio": valid_action_ratio,
+                    "illegal_action_rate": illegal_action_rate,
+                },
+            }
+            if ppo_means:
+                metrics["ppo"] = {
+                    "approx_kl_mean": ppo_means.get("approx_kl"),
+                    "clipfrac_mean": ppo_means.get("clipfrac"),
+                    "entropy_mean": ppo_means.get("entropy"),
+                    "loss_total_mean": ppo_means.get("loss_total"),
+                    "loss_actor_mean": ppo_means.get("loss_actor"),
+                    "loss_critic_mean": ppo_means.get("loss_critic"),
+                }
+            if sys_metrics:
+                metrics["sys"] = sys_metrics
+            logger.log_metrics(trained, metrics)
+
+            if early_stop_on_success and consecutive_successes >= early_stop_consecutive:
+                break
+    finally:
+        wall_time = time.time() - t0
+        # 清理
+        try:
+            train_envs.close()
+            eval_env.close()
+        except Exception:
+            pass
+
+        summary = {
+            "run_id": run_id,
+            "task_id": task.get("task_id", None),
+            "difficulty_bin": task.get("difficulty_bin", None),
+            "seed": int(seed),
+            "budget_steps": int(total_budget_steps),
+            "trained_steps": int(trained),
+            "solved": int(solved),
+            "steps_to_solve": (int(steps_to_solve) if steps_to_solve is not None else None),
+            "best_fidelity": float(best_fidelity),   # 全程最佳（跨评估轮）
+            "final_fidelity": float(final_fidelity), # 最后一次评估均值
+            "wall_time_sec": float(wall_time),
+            "time_to_solve_sec": float(t_solve) if t_solve is not None else wall_time * 10,
+            "best_qasm": best_qasm_global,
+            "solved_qasm": solved_qasm,
+            "target_qasm": target_qasm,
+            "best_gate_count": (best_stats_global or {}).get("gate_count"),
+            "best_depth": (best_stats_global or {}).get("depth"),
+            "best_cx_count": (best_stats_global or {}).get("cx_count"),
+            "best_oneq_count": (best_stats_global or {}).get("oneq_count"),
+            "mean_episode_time_sec": float(mean_episode_time),
+            "steps_per_sec": steps_per_sec if "steps_per_sec" in locals() else 0.0,  # 训练阶段
+            "env_step_time_avg_sec": env_step_time_avg if "env_step_time_avg" in locals() else 0.0,
+            "policy_infer_time_avg_sec": policy_infer_time_avg if "policy_infer_time_avg" in locals() else 0.0,
+            "update_time_avg_sec": update_time_avg if "update_time_avg" in locals() else 0.0,
+            "mask_valid_action_ratio": valid_action_ratio if "valid_action_ratio" in locals() else 0.0,
+            "illegal_action_rate": illegal_action_rate if "illegal_action_rate" in locals() else 0.0,
+            "final_entropy_mean": float(last_entropy_mean),
+            "final_p_max_mean": float(last_p_max_mean),
+            "final_margin_mean": float(last_margin_mean),
+            "final_k_eff_mean": float(last_k_eff_mean),
+        }
+        logger.log_summary(summary)
+        logger.close()
+
+    return summary  # run 级最终结果（供上层汇总/排序）
 
 def summarize_metrics(records, fidelity_threshold=0.99):
     """
@@ -445,6 +833,14 @@ def summarize_metrics(records, fidelity_threshold=0.99):
             "mean_final_fidelity": 0.0,
             "mean_wall_time_sec": 0.0,
             "mean_time_to_solve_sec": 0.0,
+            "mean_best_gate_count": None,
+            "median_best_gate_count": None,
+            "mean_best_depth": None,
+            "median_best_depth": None,
+            "mean_best_cx_count": None,
+            "mean_best_oneq_count": None,
+            "mean_episode_time_sec": None,
+            "mean_time_per_step_sec": None,
         }
 
     solved_flags = np.array([r["solved"] for r in records], dtype=np.float32)
@@ -458,7 +854,30 @@ def summarize_metrics(records, fidelity_threshold=0.99):
     final_F = float(np.mean([r.get("final_fidelity", 0.0) for r in records]))
     wall_t = float(np.mean([r.get("wall_time_sec", 0.0) for r in records]))
     time_to_solve_t = float(np.mean([r.get("time_to_solve_sec", 0.0) for r in records]))
-    
+
+    gate_counts = [r.get("best_gate_count") for r in records if r.get("best_gate_count") is not None]
+    depth_counts = [r.get("best_depth") for r in records if r.get("best_depth") is not None]
+    cx_counts = [r.get("best_cx_count") for r in records if r.get("best_cx_count") is not None]
+    oneq_counts = [r.get("best_oneq_count") for r in records if r.get("best_oneq_count") is not None]
+
+    mean_gate = float(np.mean(gate_counts)) if gate_counts else None
+    median_gate = float(np.median(gate_counts)) if gate_counts else None
+    mean_depth = float(np.mean(depth_counts)) if depth_counts else None
+    median_depth = float(np.median(depth_counts)) if depth_counts else None
+    mean_cx = float(np.mean(cx_counts)) if cx_counts else None
+    mean_oneq = float(np.mean(oneq_counts)) if oneq_counts else None
+
+    episode_times = [r.get("mean_episode_time_sec") for r in records if r.get("mean_episode_time_sec") is not None]
+    mean_episode_time = float(np.mean(episode_times)) if episode_times else None
+
+    time_per_step = []
+    for r in records:
+        budget = float(r.get("budget_steps", 0.0))
+        wt = float(r.get("wall_time_sec", 0.0))
+        if budget > 0 and np.isfinite(wt):
+            time_per_step.append(wt / budget)
+    mean_time_per_step = float(np.mean(time_per_step)) if time_per_step else None
+
     return {
         "n_runs": int(len(records)),
         "success_rate": success_rate,
@@ -468,7 +887,117 @@ def summarize_metrics(records, fidelity_threshold=0.99):
         "mean_final_fidelity": final_F,
         "mean_wall_time_sec": wall_t,
         "mean_time_to_solve_sec": time_to_solve_t,
+        "mean_best_gate_count": mean_gate,
+        "median_best_gate_count": median_gate,
+        "mean_best_depth": mean_depth,
+        "median_best_depth": median_depth,
+        "mean_best_cx_count": mean_cx,
+        "mean_best_oneq_count": mean_oneq,
+        "mean_episode_time_sec": mean_episode_time,
+        "mean_time_per_step_sec": mean_time_per_step,
     }
+
+
+def compute_weighted_scores(summaries: list, weights=None):
+    """
+    在 suite 级对候选进行带权归一化打分（BenchRL-QAS 风格）。
+    E=1-bestF，G=gate，D=depth，T=episode_time（或 step time）。
+    """
+    if weights is None:
+        weights = {"E": 0.5, "G": 0.2, "D": 0.2, "T": 0.1}
+
+    metric_values = {
+        "E": [1 - s.get("mean_best_fidelity", 0.0) for s in summaries],
+        "G": [s.get("mean_best_gate_count") for s in summaries],
+        "D": [s.get("mean_best_depth") for s in summaries],
+        "T": [s.get("mean_episode_time_sec") or s.get("mean_time_per_step_sec") for s in summaries],
+    }
+
+    normed = {}
+    for key, vals in metric_values.items():
+        finite_vals = [v for v in vals if v is not None]
+        if not finite_vals:
+            normed[key] = [None for _ in vals]
+            continue
+        vmin, vmax = min(finite_vals), max(finite_vals)
+        if abs(vmax - vmin) < 1e-9:
+            normed[key] = [0.0 if v is not None else None for v in vals]
+        else:
+            normed[key] = [((v - vmin) / (vmax - vmin)) if v is not None else None for v in vals]
+
+    for i, s in enumerate(summaries):
+        e_norm = normed["E"][i]
+        g_norm = normed["G"][i]
+        d_norm = normed["D"][i]
+        t_norm = normed["T"][i]
+        weighted = 0.0
+        for k, w in weights.items():
+            val = {"E": e_norm, "G": g_norm, "D": d_norm, "T": t_norm}.get(k, None)
+            if val is not None:
+                weighted += w * val
+        s["weighted_score"] = weighted
+        s["E_norm"] = e_norm
+        s["G_norm"] = g_norm
+        s["D_norm"] = d_norm
+        s["T_norm"] = t_norm
+
+    return summaries
+
+
+def write_suite_summary_csv(stage_name: str, scheme: str, summaries: list, out_dir: str = "logs", filename: str = "suite_summary.csv"):
+    if not summaries:
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    headers = [
+        "stage",
+        "scheme",
+        "net_cfg_name",
+        "success_rate",
+        "mean_best_fidelity",
+        "mean_final_fidelity",
+        "mean_steps_to_solve",
+        "median_steps_to_solve",
+        "mean_best_gate_count",
+        "median_best_gate_count",
+        "mean_best_depth",
+        "median_best_depth",
+        "mean_episode_time_sec",
+        "mean_time_per_step_sec",
+        "mean_wall_time_sec",
+        "weighted_score",
+        "E_norm",
+        "G_norm",
+        "D_norm",
+        "T_norm",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(",".join(headers) + "\n")
+        for s in summaries:
+            row = [
+                stage_name,
+                scheme,
+                s.get("net_cfg_name"),
+                s.get("success_rate"),
+                s.get("mean_best_fidelity"),
+                s.get("mean_final_fidelity"),
+                s.get("mean_steps_to_solve"),
+                s.get("median_steps_to_solve"),
+                s.get("mean_best_gate_count"),
+                s.get("median_best_gate_count"),
+                s.get("mean_best_depth"),
+                s.get("median_best_depth"),
+                s.get("mean_episode_time_sec"),
+                s.get("mean_time_per_step_sec"),
+                s.get("mean_wall_time_sec"),
+                s.get("weighted_score"),
+                s.get("E_norm"),
+                s.get("G_norm"),
+                s.get("D_norm"),
+                s.get("T_norm"),
+            ]
+            f.write(",".join("" if v is None else str(v) for v in row) + "\n")
+    return path
 
 def run_cfg_on_taskset(
     *,
@@ -503,6 +1032,7 @@ def run_cfg_on_taskset(
 
             rec = run_one_task(
                 task,
+                stage_name=stage_name,
                 scheme=scheme,
                 net_cfg=net_cfg,
                 algo_cfg=algo_cfg,
@@ -574,12 +1104,15 @@ def run_stage(
         all_records_by_cfg[net_cfg.get("name", "net_cfg")] = records
         all_summaries.append(summary)
 
-    # 4) ranking (默认：成功率优先，其次 steps_to_solve 越小越好，其次 best_fidelity 越大越好)
+    # 4) ranking （带权 + 兼容旧策略）
+    all_summaries = compute_weighted_scores(all_summaries)
+
     def rank_key(s):
-        # steps_to_solve None 说明没成功过 → 认为非常差
         steps = s["mean_steps_to_solve"]
         steps_key = steps if steps is not None else 1e18
-        return (-s["success_rate"], steps_key, -s["mean_best_fidelity"], s["mean_wall_time_sec"])
+        ws = s.get("weighted_score", None)
+        ws_key = ws if ws is not None else 1e9
+        return (ws_key, -s["success_rate"], steps_key, -s["mean_best_fidelity"], s["mean_wall_time_sec"])
 
     all_summaries_sorted = sorted(all_summaries, key=rank_key)
 
@@ -592,8 +1125,21 @@ def run_stage(
                 f"mean_steps={s['mean_steps_to_solve']}  "
                 f"bestF={s['mean_best_fidelity']:.4f}  "
                 f"finalF={s['mean_final_fidelity']:.4f}  "
+                f"gate={s.get('mean_best_gate_count')}  "
+                f"depth={s.get('mean_best_depth')}  "
+                f"T={s.get('mean_episode_time_sec')}  "
+                f"Wscore={s.get('weighted_score'):.4f}  "
                 f"time={s['mean_wall_time_sec']:.1f}s"
             )
+
+    # 5) 写 suite summary CSV
+    log_dir = train_cfg.get("log_dir", "logs")
+    csv_path = write_suite_summary_csv(
+        stage_name=suite_name,
+        scheme=scheme,
+        summaries=all_summaries_sorted,
+        out_dir=os.path.join(log_dir, str(suite_name)),
+    )
 
     return {
         "sample_summary": sample_summary,
@@ -601,6 +1147,7 @@ def run_stage(
         "summaries_sorted": all_summaries_sorted,
         "summaries_raw": all_summaries,
         "records_by_cfg": all_records_by_cfg,
+        "suite_summary_csv": csv_path,
     }
 
 
@@ -695,6 +1242,7 @@ def run_task_by_id(
 
 def run_suite_all_tasks(
     *,
+
     in_dir: str,
     suite_name: str,
     scheme: str,
@@ -704,12 +1252,16 @@ def run_suite_all_tasks(
     seeds: list,
     device: str,
     verbose: bool = True,
+    tasks_set = None,
 ):
     """
     在指定任务集上运行所有任务（不抽样），按 net_cfg 列出总结并排序。
     复用 run_cfg_on_taskset，排序规则与 run_stage 保持一致。
     """
-    tasks = normalize_tasks(load_task_suite(in_dir, suite_name))
+    if tasks_set is None:
+        tasks = normalize_tasks(load_task_suite(in_dir, suite_name))
+    else:
+        tasks = tasks_set
 
     if verbose:
         print(f"\n=== Run full suite {suite_name} / scheme={scheme} ===")
@@ -733,10 +1285,14 @@ def run_suite_all_tasks(
         all_records_by_cfg[net_cfg.get("name", "net_cfg")] = records
         all_summaries.append(summary)
 
+    all_summaries = compute_weighted_scores(all_summaries)
+
     def rank_key(s):
         steps = s["mean_steps_to_solve"]
         steps_key = steps if steps is not None else 1e18
-        return (-s["success_rate"], steps_key, -s["mean_best_fidelity"], s["mean_wall_time_sec"])
+        ws = s.get("weighted_score", None)
+        ws_key = ws if ws is not None else 1e9
+        return (ws_key, -s["success_rate"], steps_key, -s["mean_best_fidelity"], s["mean_wall_time_sec"])
 
     all_summaries_sorted = sorted(all_summaries, key=rank_key)
 
@@ -749,38 +1305,153 @@ def run_suite_all_tasks(
                 f"mean_steps={s['mean_steps_to_solve']}  "
                 f"bestF={s['mean_best_fidelity']:.4f}  "
                 f"finalF={s['mean_final_fidelity']:.4f}  "
+                f"gate={s.get('mean_best_gate_count')}  "
+                f"depth={s.get('mean_best_depth')}  "
+                f"T={s.get('mean_episode_time_sec')}  "
+                f"Wscore={s.get('weighted_score'):.4f}  "
                 f"time={s['mean_wall_time_sec']:.1f}s"
             )
+
+    csv_path = write_suite_summary_csv(
+        stage_name=suite_name,
+        scheme=scheme,
+        summaries=all_summaries_sorted,
+        out_dir=os.path.join(train_cfg.get("log_dir", "logs"), str(suite_name)),
+    )
 
     return {
         "tasks": tasks,
         "summaries_sorted": all_summaries_sorted,
         "summaries_raw": all_summaries,
         "records_by_cfg": all_records_by_cfg,
+        "suite_summary_csv": csv_path,
     }
 
 
-def main():
-    pass
-
-
-if __name__ == "__main__":
-  
+def main(
+scheme: str, 
+net_cfg_list: list, 
+algo_cfg: dict, 
+train_cfg: dict, 
+seeds: list, 
+in_dir: str = "task_suites", 
+suite_name: str = "Final", 
+sampled_json_path: str = "Final_sampled_bin10.json",
+):
+      
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # 任务集
-    in_dir = "task_suites"
-    suite_name = "Guided"
-    scheme = "gate_seq"
-
-    # 抽样：你给的 bin_counts
-    bin_counts = [1, 0, 0, 0, 0]
-    task_sample_seed = 123
-
+    scheme = scheme
+    
     # ----------------
     # 1) network configs (baseline grid)
     #   说明：net_cfg 通过 Encoder_MLP.from_cfg + SharedMLP 共同生效
     # ----------------
+    if net_cfg_list is None:
+        net_cfg_list_final = [
+            {"name": "E055k_h64_d2",
+             "hid": 64, "depth": 2,
+             "act": "silu", "use_ln": True,
+             "dropout": 0.0, "input_dropout": 0.0,
+             "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+        ]
+    else:
+        net_cfg_list_final = net_cfg_list
+    # ----------------
+    # 2) PPO algo cfg (两个版本：标准 / 更强探索)
+    # ----------------
+    if algo_cfg is None:
+        algo_cfg_final = {
+            "lr": 3e-4,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "max_grad_norm": 0.5,
+            "eps_clip": 0.2,
+            "vf_coef": 0.5,
+            "ent_coef": 0.02,  # 比你原来的 0.01 更鼓励探索（Dev 阶段更有用）
+            "advantage_normalization": True,
+            "value_clip": False,
+            "return_scaling": False,
+        }
+    else:
+        algo_cfg_final = algo_cfg
+    
+
+    # ----------------
+    # 3) train cfg (Dev：先跑通 + 快速出信号)
+    #   注意：run_one_task 里每 eval_every_steps 会重新建一次 on-policy buffer
+    # ----------------
+    if train_cfg is None:
+        train_cfg_final = {
+            "n_train_env": 8, 
+            "n_test_env": 8, 
+            "n_eval_env": 8, 
+            "n_eval_episodes": 100, 
+            "n_eval_steps": 100, 
+        }
+    else:
+        train_cfg_final = train_cfg
+
+    # ----------------
+    # 4) seeds（先 smoke：1 个；跑 baseline：2~3 个）
+    # ----------------
+    if seeds is None:
+        seeds_final = [0, 1, 2, 3, 4]
+    else:
+        seeds_final = seeds
+
+    # ----------------
+    # 5) 日志：stdout/stderr 同时写到文件，便于后续查看
+    # ----------------
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 定制日志文件名（同目录下），便于直接查阅；加时间戳避免覆盖
+    log_path = os.path.join(log_dir, f"{ts}_log.log")
+
+    class Tee(io.TextIOBase):
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+            return len(data)
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+    with open(log_path, "w", encoding="utf-8") as f, \
+         redirect_stdout(Tee(sys.stdout, f)), \
+         redirect_stderr(Tee(sys.stderr, f)):
+        
+        print(f"[log] writing to {log_path}")
+        ## task suite preparation
+        tasks = load_sampled_tasks_by_bin(
+            in_dir=in_dir,
+            suite_name=suite_name,
+            sampled_json_path=sampled_json_path,)
+
+        for bin_name, task_list in tasks.items():
+
+    
+            run_suite_all_tasks(
+                in_dir=in_dir,
+                suite_name=suite_name,
+                scheme=scheme,
+                net_cfg_list=net_cfg_list_final,
+                algo_cfg=algo_cfg_final,
+                train_cfg=train_cfg_final,
+                seeds=seeds_final,
+                device=device,
+                verbose=True,
+                tasks_set=task_list,
+            )
+    
+
+
+if __name__ == "__main__":
+    main(
+    scheme = "gate_seq", 
     net_cfg_list = [
     # ====== Tiny / Smoke ======
     {"name": "E055k_h64_d2",
@@ -837,14 +1508,7 @@ if __name__ == "__main__":
      "act": "silu", "use_ln": True,
      "dropout": 0.0, "input_dropout": 0.0,
      "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-    
-     ]
-    
-            
-
-    # ----------------
-    # 2) PPO algo cfg (两个版本：标准 / 更强探索)
-    # ----------------
+     ],
     algo_cfg = {
         "lr": 3e-4,
         "gamma": 0.99,
@@ -856,81 +1520,32 @@ if __name__ == "__main__":
         "advantage_normalization": True,
         "value_clip": False,
         "return_scaling": False,
-    }
-
-    # ----------------
-    # 3) train cfg (Dev：先跑通 + 快速出信号)
-    #   注意：run_one_task 里每 eval_every_steps 会重新建一次 on-policy buffer
-    # ----------------
-    train_cfg = {
+    }, 
+    train_cfg= {
         "n_train_env": 8, 
-
         # 先别太大：调 bug / 看趋势用 30k~50k 更合适
         "total_budget_steps": 500000, 
-
         # 每 5k 做一次 greedy_eval（steps_to_solve 粒度也就是 5k）
         "eval_every_steps": 5000,
-        "eval_episodes": 1,
-
+        "eval_episodes": 5, ## 不应该是1，有些参数每个espisode都不一样
         # PPO rollout / update 强度：先保守，稳定优先
         "collect_steps": 2048,
         "update_reps": 8,
         "batch_size": 256,
-
         # buffer_size 只是下限，代码里会用 max(buffer_size, this_chunk*2) 兜底
         "buffer_size": 20000,
-
         # 需要的话你也能显式写死阈值（否则从 env 里读）
         "fidelity_threshold": 0.95,
-
         # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
         "max_gates": 20,  ##最大14 1.4* 14 = 20
-
         # 评估成功后直接提前停掉，节省预算
         "early_stop_on_success": True,
         # 连续成功多少次才提前停（>=1）
         "early_stop_consecutive_success": 3,
-    }
-
-    # ----------------
-    # 4) seeds（先 smoke：1 个；跑 baseline：2~3 个）
-    # ----------------
-    seeds = [0, 1, 2, 3, 4] 
-
-    # ----------------
-    # 5) 日志：stdout/stderr 同时写到文件，便于后续查看
-    # ----------------
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    # 定制日志文件名（同目录下），便于直接查阅
-    log_path = os.path.join(log_dir, "E268k_h256_d2_log.log")
-
-    class Tee(io.TextIOBase):
-        def __init__(self, *streams):
-            self.streams = streams
-        def write(self, data):
-            for s in self.streams:
-                s.write(data)
-                s.flush()
-            return len(data)
-        def flush(self):
-            for s in self.streams:
-                s.flush()
-
-    with open(log_path, "w", encoding="utf-8") as f, \
-         redirect_stdout(Tee(sys.stdout, f)), \
-         redirect_stderr(Tee(sys.stderr, f)):
-
-        print(f"[log] writing to {log_path}")
-        run_suite_all_tasks(
-            in_dir=in_dir,
-            suite_name=suite_name,
-            scheme=scheme,
-            net_cfg_list=net_cfg_list,
-            algo_cfg=algo_cfg,
-            train_cfg=train_cfg,
-            seeds=seeds,
-            device=device,
-            verbose=True,
-        )
+    }, 
+        seeds=[0, 1, 2, 3, 4], 
+        in_dir="task_suites", 
+        suite_name="Final", 
+        sampled_json_path="task_suites/Final_sampled_bin10.json"
+        
+        )    
