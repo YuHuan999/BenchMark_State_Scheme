@@ -31,10 +31,22 @@ from env import CircuitDesignerDiscrete
 from generate_task_suite.prepare_tasks import load_task_suite
 from wrapper_represent import RepresentationWrapper
 from encoders.encoder_MLP import Encoder_MLP
+from trace_recorder import infer_step, rollout_trace
 
 from typing import Dict, List, Tuple, Any
 
 DEFAULT_BINS_ORDER = ["easy", "medium", "hard", "very_hard", "extreme"]
+
+
+def _try_get_optim_state(algorithm):
+    for name in ["optim", "_optim", "optimizer", "_optimizer"]:
+        opt = getattr(algorithm, name, None)
+        if opt is not None and hasattr(opt, "state_dict"):
+            try:
+                return opt.state_dict()
+            except Exception:
+                continue
+    return None
 
 
 class RunLogger:
@@ -145,7 +157,7 @@ class ActorCritic(nn.Module):
         self.actor_head = nn.Linear(feat_dim, act_dim)
         self.critic_head = nn.Linear(feat_dim, 1)
 
-    def _feat(self, obs):
+    def _zh(self, obs):
         state = obs["state"]
         if isinstance(state, np.ndarray):
             state = torch.from_numpy(state)
@@ -153,11 +165,14 @@ class ActorCritic(nn.Module):
 
         z = self.encoder(state)   # [B, enc_dim]
         h = self.shared(z)        # [B, feat_dim]
-        return h
+        return z, h
+
+    def _feat(self, obs):
+        return self._zh(obs)[1]
 
     def forward_actor(self, obs, state=None, info=None):
         mask = obs.get("action_mask", None)
-        feat = self._feat(obs)
+        z, feat = self._zh(obs)
         logits = self.actor_head(feat)
 
         if mask is not None:
@@ -165,6 +180,8 @@ class ActorCritic(nn.Module):
             logits = logits.masked_fill(~m, -1e9)
 
         if info is not None and isinstance(info, dict):
+            info["z"] = z.detach()
+            info["h"] = feat.detach()
             info["embedding"] = feat.detach()
 
         return logits, state
@@ -413,6 +430,16 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         task_id=task_id,
         seed=seed,
     )
+    # trace / ckpt 目录
+    traces_train_dir = os.path.join(logger.run_dir, "traces", "train")
+    traces_eval_dir = os.path.join(logger.run_dir, "traces", "eval")
+    ckpt_dir = os.path.join(logger.run_dir, "checkpoints")
+    os.makedirs(traces_train_dir, exist_ok=True)
+    os.makedirs(traces_eval_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    chunks_index_path = os.path.join(logger.run_dir, "chunks.jsonl")
+    if not os.path.exists(chunks_index_path):
+        open(chunks_index_path, "a", encoding="utf-8").close()
 
     # 记录 config 快照（一次性）
     config_snapshot = {
@@ -437,6 +464,12 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         "tianshou_module_path": getattr(sys.modules.get(PPO.__module__, None), "__file__", None),
         "git_commit": None,
         "seed_everything": int(seed),
+        "trace_schema": [
+            "env_id", "episode_id", "z", "h", "logits", "value", "mask",
+            "action", "fidelity_after", "reward_after", "terminated", "truncated"
+        ],
+        "trace_record_phase": "pre_action",
+        "trace_logits_are_masked": True,
     }
     try:
         git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.getcwd()).decode().strip()
@@ -449,8 +482,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     # 6) 评估函数：greedy(argmax)（稳定，适合比较超参）
     # -----------------------
     @torch.no_grad()
-    def greedy_eval():
-        actor.eval()
+    def greedy_eval(eval_trace_path=None):
         succ = 0
         fids = []
         best_qasm = None
@@ -464,18 +496,28 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         p_max_list = []
         margin_list = []
         k_eff_list = []
+
+        trace_env_ids = []
+        trace_ep_ids = []
+        trace_z = []
+        trace_h = []
+        trace_logits = []
+        trace_value = []
+        trace_mask = []
+        trace_action = []
+        trace_fid_after = []
+        trace_rew_after = []
+        trace_term = []
+        trace_trunc = []
+
         for ep in range(eval_episodes):
             ep_t0 = time.perf_counter()
             obs, info = eval_env.reset(seed=seed + 20_000 + ep)
             done = False
             last_info = info
             while not done:
-                obs_b = {
-                    "state": np.expand_dims(obs["state"], axis=0),
-                    "action_mask": np.expand_dims(obs["action_mask"], axis=0) if "action_mask" in obs else None,
-                }
-                logits, _ = actor(obs_b)
-                probs = torch.softmax(logits[0], dim=-1)
+                z_np, h_np, logits_np, value_np, mask_np = infer_step(ac, obs, device)
+                probs = torch.softmax(torch.from_numpy(logits_np), dim=-1)
                 p_sorted = torch.sort(probs, descending=True).values
                 p_max = float(p_sorted[0].item())
                 p_max_list.append(p_max)
@@ -484,12 +526,12 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 else:
                     margin = 0.0
                 margin_list.append(margin)
-                entropy = float(Categorical(logits=logits[0]).entropy().item())
+                entropy = float(Categorical(logits=torch.from_numpy(logits_np)).entropy().item())
                 entropies.append(entropy)
                 k_eff = float(1.0 / max(1e-12, torch.sum(probs * probs).item()))
                 k_eff_list.append(k_eff)
 
-                a = int(torch.argmax(logits[0]).item())
+                a = int(np.argmax(logits_np))
                 obs, r, terminated, truncated, last_info = eval_env.step(a)
                 done = bool(terminated or truncated)
                 mask_eval = last_info.get("action_mask", None) if isinstance(last_info, dict) else None
@@ -498,6 +540,19 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 if isinstance(last_info, dict) and last_info.get("illegal", False):
                     illegal_cnt += 1
                 total_steps += 1
+
+                trace_env_ids.append(0)
+                trace_ep_ids.append(ep)
+                trace_z.append(z_np.astype(np.float16))
+                trace_h.append(h_np.astype(np.float16))
+                trace_logits.append(logits_np.astype(np.float16))
+                trace_value.append(value_np)
+                trace_mask.append(mask_np.astype(np.uint8))
+                trace_action.append(a)
+                trace_fid_after.append(float(last_info.get("fidelity", 0.0)))
+                trace_rew_after.append(float(r))
+                trace_term.append(np.uint8(terminated))
+                trace_trunc.append(np.uint8(truncated))
 
             ep_steps.append(int(last_info.get("step_count", len(getattr(eval_env, "gate_tokens", [])))))
             ep_times.append(time.perf_counter() - ep_t0)
@@ -523,6 +578,27 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         p_max_mean = float(np.mean(p_max_list)) if p_max_list else 0.0
         margin_mean = float(np.mean(margin_list)) if margin_list else 0.0
         k_eff_mean = float(np.mean(k_eff_list)) if k_eff_list else 0.0
+
+        if eval_trace_path is not None and trace_action:
+            def _stack(lst, dtype=None):
+                arr = np.stack(lst, axis=0)
+                return arr.astype(dtype) if dtype is not None else arr
+            np.savez_compressed(
+                eval_trace_path,
+                env_id=_stack(trace_env_ids, np.int32),
+                episode_id=_stack(trace_ep_ids, np.int32),
+                z=_stack(trace_z, np.float16),
+                h=_stack(trace_h, np.float16),
+                logits=_stack(trace_logits, np.float16),
+                value=_stack(trace_value, np.float32),
+                mask=_stack(trace_mask, np.uint8),
+                action=_stack(trace_action, np.int32),
+                fidelity_after=_stack(trace_fid_after, np.float32),
+                reward_after=_stack(trace_rew_after, np.float32),
+                terminated=_stack(trace_term, np.uint8),
+                truncated=_stack(trace_trunc, np.uint8),
+            )
+
         return (
             succ,
             float(np.mean(fids)) if fids else 0.0,
@@ -564,6 +640,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         target_qasm = None
 
     trained = 0
+    chunk_idx = 0
     consecutive_successes = 0  # 连续成功的评估次数
 
     # profile 累积器（用差分得到“本 chunk”均值）
@@ -625,8 +702,37 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
             train_chunk_time = time.perf_counter() - t_train_start
             trained += this_chunk
 
+            # 训练 trace（单独环境，避免污染训练）
+            trace_train_eps = int(train_cfg.get("trace_train_episodes", 2))
+            trace_train_env = make_env(
+                train_tasks, test_tasks,
+                mode="train", scheme=scheme,
+                seed=seed + 30_000 + chunk_idx,
+                fidelity_threshold=fidelity_threshold_cfg,
+                max_gates=max_gates_cfg,
+            )
+            train_trace_path = os.path.join(
+                traces_train_dir, f"chunk_{chunk_idx:04d}_step_{trained:08d}.npz"
+            )
+            rollout_trace(
+                trace_train_env,
+                ac,
+                device,
+                mode="train",
+                episodes=trace_train_eps,
+                seed_base=seed + 40_000 + chunk_idx * 10_000,
+                out_path=train_trace_path,
+            )
+            try:
+                trace_train_env.close()
+            except Exception:
+                pass
+
             # 评估
             t_eval_start = time.perf_counter()
+            eval_trace_path = os.path.join(
+                traces_eval_dir, f"chunk_{chunk_idx:04d}_step_{trained:08d}.npz"
+            )
             (
                 succ,
                 mean_F,
@@ -640,7 +746,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 p_max_mean_eval,
                 margin_mean_eval,
                 k_eff_mean_eval,
-            ) = greedy_eval()
+            ) = greedy_eval(eval_trace_path=eval_trace_path)
             eval_time = time.perf_counter() - t_eval_start
             final_fidelity = mean_F
             best_fidelity = max(best_fidelity, mean_F)
@@ -649,6 +755,25 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
             last_p_max_mean = p_max_mean_eval
             last_margin_mean = margin_mean_eval
             last_k_eff_mean = k_eff_mean_eval
+
+            # 保存 checkpoint（模型/优化器/RNG）
+            ckpt_path = os.path.join(
+                ckpt_dir, f"ckpt_chunk_{chunk_idx:04d}_step_{trained:08d}.pt"
+            )
+            optim_state = _try_get_optim_state(algorithm)
+            ckpt = {
+                "chunk_idx": chunk_idx,
+                "trained_steps": trained,
+                "ac_state_dict": ac.state_dict(),
+                "algorithm_state_dict": algorithm.state_dict(),
+                "optim_state_dict": optim_state,
+                "rng": {
+                    "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                },
+            }
+            torch.save(ckpt, ckpt_path)
 
             if (not solved) and succ > 0:
                 solved = True
@@ -768,10 +893,26 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 }
             if sys_metrics:
                 metrics["sys"] = sys_metrics
+
+            # 索引文件：记录 trace / ckpt 路径
+            try:
+                chunk_entry = {
+                    "chunk_idx": int(chunk_idx),
+                    "trained_steps": int(trained),
+                    "train_trace": os.path.relpath(train_trace_path, logger.run_dir),
+                    "eval_trace": os.path.relpath(eval_trace_path, logger.run_dir),
+                    "ckpt": os.path.relpath(ckpt_path, logger.run_dir),
+                }
+                with open(chunks_index_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(chunk_entry, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
             logger.log_metrics(trained, metrics)
 
             if early_stop_on_success and consecutive_successes >= early_stop_consecutive:
                 break
+            chunk_idx += 1
     finally:
         wall_time = time.time() - t0
         # 清理
