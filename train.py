@@ -23,6 +23,7 @@ from qiskit import QuantumCircuit
 from tianshou.env import DummyVectorEnv
 from tianshou.data import Collector, VectorReplayBuffer
 from tianshou.algorithm import PPO
+from tianshou.algorithm.algorithm_base import policy_within_training_step
 from tianshou.algorithm.modelfree.reinforce import ProbabilisticActorPolicy
 from tianshou.algorithm.optim import AdamOptimizerFactory
 from tianshou.trainer import OnPolicyTrainerParams
@@ -31,10 +32,139 @@ from env import CircuitDesignerDiscrete
 from generate_task_suite.prepare_tasks import load_task_suite
 from wrapper_represent import RepresentationWrapper
 from encoders.encoder_MLP import Encoder_MLP
+from trace_recorder import infer_step, rollout_trace
 
 from typing import Dict, List, Tuple, Any
 
 DEFAULT_BINS_ORDER = ["easy", "medium", "hard", "very_hard", "extreme"]
+
+
+def _try_get_optim_state(algorithm):
+    for name in ["optim", "_optim", "optimizer", "_optimizer"]:
+        opt = getattr(algorithm, name, None)
+        if opt is not None and hasattr(opt, "state_dict"):
+            try:
+                return opt.state_dict()
+            except Exception:
+                continue
+    return None
+
+
+def _merge_trace_cache(actor_cache, value_cache):
+    """
+    把 ActorCritic.trace_actor_cache / trace_value_cache 合并成 (z, h, logits, mask, value) numpy 数组。
+    actor_cache: list of (z, h, logits, mask)，每项 shape=[B, ...]
+    value_cache: list of value，每项 shape=[B]
+    返回：(z, h, logits, mask, value)，每项 shape=[total_steps, ...]
+    """
+    if not actor_cache:
+        return None, None, None, None, None
+
+    z_all = torch.cat([item[0] for item in actor_cache], dim=0).numpy()
+    h_all = torch.cat([item[1] for item in actor_cache], dim=0).numpy()
+    logits_all = torch.cat([item[2] for item in actor_cache], dim=0).numpy()
+    mask_all = torch.cat([item[3] for item in actor_cache], dim=0).numpy()
+
+    if value_cache:
+        value_all = torch.cat(value_cache, dim=0).numpy()
+    else:
+        # 如果 critic 没有被调用（不太可能），填充 0
+        value_all = np.zeros(z_all.shape[0], dtype=np.float32)
+
+    return z_all, h_all, logits_all, mask_all, value_all
+
+
+def _write_train_trace_from_buffer(buf, trace_data, out_path):
+    """
+    用 buffer 里的 (obs, act, rew, done, info) 和预先收集的 trace_data 写 trace 文件。
+    trace_data: (z, h, logits, mask, value) numpy 数组，来自 _merge_trace_cache。
+    如果 trace_data 为 None，则跳过 z/h/logits/mask/value 的写入（仅写 buffer 基础信息）。
+    """
+    size = len(buf)
+    if size == 0:
+        return {"episodes": 0, "steps": 0, "path": out_path}
+
+    batch_all = buf[np.arange(size)]
+    acts = batch_all.act
+    rews = batch_all.rew
+    dones = batch_all.done
+    infos = batch_all.info
+
+    # 解包 trace_data
+    z_all, h_all, logits_all, mask_all, value_all = trace_data if trace_data else (None, None, None, None, None)
+
+    env_ids = []
+    ep_ids = []
+    z_list = []
+    h_list = []
+    logits_list = []
+    value_list = []
+    mask_list = []
+    act_list = []
+    fid_after_list = []
+    rew_after_list = []
+    term_list = []
+    trunc_list = []
+
+    ep_counter = defaultdict(int)
+
+    for i in range(size):
+        # env_id / episode_id
+        info_i = infos[i]
+        env_id = int(info_i.get("env_id", 0)) if isinstance(info_i, dict) else 0
+        env_ids.append(env_id)
+        ep_ids.append(ep_counter[env_id])
+
+        # 从 trace_data 取 z/h/logits/mask/value（不再二次前向）
+        if z_all is not None and i < len(z_all):
+            z_list.append(z_all[i].astype(np.float16))
+            h_list.append(h_all[i].astype(np.float16))
+            logits_list.append(logits_all[i].astype(np.float16))
+            mask_list.append(mask_all[i].astype(np.uint8) if mask_all[i].dtype != np.uint8 else mask_all[i])
+            value_list.append(np.float32(value_all[i]))
+        else:
+            # 没有 trace_data 时填充 placeholder（不应该发生）
+            z_list.append(np.zeros(1, dtype=np.float16))
+            h_list.append(np.zeros(1, dtype=np.float16))
+            logits_list.append(np.zeros(1, dtype=np.float16))
+            mask_list.append(np.zeros(1, dtype=np.uint8))
+            value_list.append(np.float32(0.0))
+
+        a = int(acts[i])
+        done_flag = bool(dones[i])
+        fid_after = float(info_i.get("fidelity", 0.0)) if isinstance(info_i, dict) else 0.0
+        terminated = bool(info_i.get("terminated", done_flag)) if isinstance(info_i, dict) else done_flag
+        truncated = bool(info_i.get("truncated", False)) if isinstance(info_i, dict) else False
+
+        act_list.append(a)
+        fid_after_list.append(fid_after)
+        rew_after_list.append(float(rews[i]))
+        term_list.append(np.uint8(terminated))
+        trunc_list.append(np.uint8(truncated))
+
+        if done_flag:
+            ep_counter[env_id] += 1
+
+    def _stack(lst, dtype=None):
+        arr = np.stack(lst, axis=0)
+        return arr.astype(dtype) if dtype is not None else arr
+
+    out = {
+        "env_id": _stack(env_ids, np.int32),
+        "episode_id": _stack(ep_ids, np.int32),
+        "z": _stack(z_list, np.float16),
+        "h": _stack(h_list, np.float16),
+        "logits": _stack(logits_list, np.float16),
+        "value": _stack(value_list, np.float32),
+        "mask": _stack(mask_list, np.uint8),
+        "action": _stack(act_list, np.int32),
+        "fidelity_after": _stack(fid_after_list, np.float32),
+        "reward_after": _stack(rew_after_list, np.float32),
+        "terminated": _stack(term_list, np.uint8),
+        "truncated": _stack(trunc_list, np.uint8),
+    }
+    np.savez_compressed(out_path, **out)
+    return {"episodes": int(sum(term_list) + sum(trunc_list)), "steps": size, "path": out_path}
 
 
 class RunLogger:
@@ -145,7 +275,32 @@ class ActorCritic(nn.Module):
         self.actor_head = nn.Linear(feat_dim, act_dim)
         self.critic_head = nn.Linear(feat_dim, 1)
 
-    def _feat(self, obs):
+        # ===== Trace 缓存：collect 时收集 z/h/logits/mask/value，不需二次前向 =====
+        self.trace_enabled = False       # 是否启用 trace 缓存
+        self.trace_actor_cache = []      # 每次 forward_actor 追加 (z, h, logits, mask)
+        self.trace_value_cache = []      # 每次 forward_critic 追加 value
+
+    def enable_trace(self):
+        """启用 trace 缓存，collect 时调用。"""
+        self.trace_enabled = True
+        self.trace_actor_cache.clear()
+        self.trace_value_cache.clear()
+
+    def disable_trace(self):
+        """禁用 trace 缓存并清空。"""
+        self.trace_enabled = False
+        self.trace_actor_cache.clear()
+        self.trace_value_cache.clear()
+
+    def get_trace_cache(self):
+        """
+        返回 (actor_cache, value_cache)，调用方负责合并。
+        actor_cache: list of (z, h, logits, mask)  每项 shape=[B, ...]
+        value_cache: list of value  每项 shape=[B]
+        """
+        return self.trace_actor_cache, self.trace_value_cache
+
+    def _zh(self, obs):
         state = obs["state"]
         if isinstance(state, np.ndarray):
             state = torch.from_numpy(state)
@@ -153,25 +308,54 @@ class ActorCritic(nn.Module):
 
         z = self.encoder(state)   # [B, enc_dim]
         h = self.shared(z)        # [B, feat_dim]
-        return h
+        return z, h
+
+    def _feat(self, obs):
+        return self._zh(obs)[1]
 
     def forward_actor(self, obs, state=None, info=None):
         mask = obs.get("action_mask", None)
-        feat = self._feat(obs)
+        z, feat = self._zh(obs)
         logits = self.actor_head(feat)
 
         if mask is not None:
             m = torch.as_tensor(mask, device=logits.device).bool()
             logits = logits.masked_fill(~m, -1e9)
 
+        # 写入外部传入的 info（用于 eval trace 等场景）
         if info is not None and isinstance(info, dict):
+            info["z"] = z.detach()
+            info["h"] = feat.detach()
             info["embedding"] = feat.detach()
+            info["logits"] = logits.detach()
+            # mask 也写入 info
+            if mask is not None:
+                info["mask"] = torch.as_tensor(mask, device=logits.device).detach()
+
+        # ===== 如果启用 trace 缓存，追加到列表 =====
+        if self.trace_enabled:
+            mask_tensor = torch.as_tensor(mask, device=logits.device) if mask is not None else torch.ones_like(logits, dtype=torch.bool)
+            self.trace_actor_cache.append((
+                z.detach().cpu(),
+                feat.detach().cpu(),
+                logits.detach().cpu(),
+                mask_tensor.detach().cpu(),
+            ))
 
         return logits, state
 
     def forward_critic(self, obs, state=None, info=None):
         feat = self._feat(obs)
         value = self.critic_head(feat).squeeze(-1)
+
+        # 写入外部传入的 info
+        if info is not None and isinstance(info, dict):
+            info["value"] = value.detach()
+
+        # ===== 如果启用 trace 缓存，追加 value =====
+        if self.trace_enabled:
+            self.trace_value_cache.append(value.detach().cpu())
+
         return value
 
 class ActorWrapper(nn.Module):
@@ -413,6 +597,16 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         task_id=task_id,
         seed=seed,
     )
+    # trace / ckpt 目录
+    traces_train_dir = os.path.join(logger.run_dir, "traces", "train")
+    traces_eval_dir = os.path.join(logger.run_dir, "traces", "eval")
+    ckpt_dir = os.path.join(logger.run_dir, "checkpoints")
+    os.makedirs(traces_train_dir, exist_ok=True)
+    os.makedirs(traces_eval_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    chunks_index_path = os.path.join(logger.run_dir, "chunks.jsonl")
+    if not os.path.exists(chunks_index_path):
+        open(chunks_index_path, "a", encoding="utf-8").close()
 
     # 记录 config 快照（一次性）
     config_snapshot = {
@@ -437,6 +631,12 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         "tianshou_module_path": getattr(sys.modules.get(PPO.__module__, None), "__file__", None),
         "git_commit": None,
         "seed_everything": int(seed),
+        "trace_schema": [
+            "env_id", "episode_id", "z", "h", "logits", "value", "mask",
+            "action", "fidelity_after", "reward_after", "terminated", "truncated"
+        ],
+        "trace_record_phase": "pre_action",
+        "trace_logits_are_masked": True,
     }
     try:
         git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.getcwd()).decode().strip()
@@ -449,8 +649,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     # 6) 评估函数：greedy(argmax)（稳定，适合比较超参）
     # -----------------------
     @torch.no_grad()
-    def greedy_eval():
-        actor.eval()
+    def greedy_eval(eval_trace_path=None):
         succ = 0
         fids = []
         best_qasm = None
@@ -464,18 +663,28 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         p_max_list = []
         margin_list = []
         k_eff_list = []
+
+        trace_env_ids = []
+        trace_ep_ids = []
+        trace_z = []
+        trace_h = []
+        trace_logits = []
+        trace_value = []
+        trace_mask = []
+        trace_action = []
+        trace_fid_after = []
+        trace_rew_after = []
+        trace_term = []
+        trace_trunc = []
+
         for ep in range(eval_episodes):
             ep_t0 = time.perf_counter()
             obs, info = eval_env.reset(seed=seed + 20_000 + ep)
             done = False
             last_info = info
             while not done:
-                obs_b = {
-                    "state": np.expand_dims(obs["state"], axis=0),
-                    "action_mask": np.expand_dims(obs["action_mask"], axis=0) if "action_mask" in obs else None,
-                }
-                logits, _ = actor(obs_b)
-                probs = torch.softmax(logits[0], dim=-1)
+                z_np, h_np, logits_np, value_np, mask_np = infer_step(ac, obs, device)
+                probs = torch.softmax(torch.from_numpy(logits_np), dim=-1)
                 p_sorted = torch.sort(probs, descending=True).values
                 p_max = float(p_sorted[0].item())
                 p_max_list.append(p_max)
@@ -484,12 +693,12 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 else:
                     margin = 0.0
                 margin_list.append(margin)
-                entropy = float(Categorical(logits=logits[0]).entropy().item())
+                entropy = float(Categorical(logits=torch.from_numpy(logits_np)).entropy().item())
                 entropies.append(entropy)
                 k_eff = float(1.0 / max(1e-12, torch.sum(probs * probs).item()))
                 k_eff_list.append(k_eff)
 
-                a = int(torch.argmax(logits[0]).item())
+                a = int(np.argmax(logits_np))
                 obs, r, terminated, truncated, last_info = eval_env.step(a)
                 done = bool(terminated or truncated)
                 mask_eval = last_info.get("action_mask", None) if isinstance(last_info, dict) else None
@@ -498,6 +707,19 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 if isinstance(last_info, dict) and last_info.get("illegal", False):
                     illegal_cnt += 1
                 total_steps += 1
+
+                trace_env_ids.append(0)
+                trace_ep_ids.append(ep)
+                trace_z.append(z_np.astype(np.float16))
+                trace_h.append(h_np.astype(np.float16))
+                trace_logits.append(logits_np.astype(np.float16))
+                trace_value.append(value_np)
+                trace_mask.append(mask_np.astype(np.uint8))
+                trace_action.append(a)
+                trace_fid_after.append(float(last_info.get("fidelity", 0.0)))
+                trace_rew_after.append(float(r))
+                trace_term.append(np.uint8(terminated))
+                trace_trunc.append(np.uint8(truncated))
 
             ep_steps.append(int(last_info.get("step_count", len(getattr(eval_env, "gate_tokens", [])))))
             ep_times.append(time.perf_counter() - ep_t0)
@@ -523,6 +745,27 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         p_max_mean = float(np.mean(p_max_list)) if p_max_list else 0.0
         margin_mean = float(np.mean(margin_list)) if margin_list else 0.0
         k_eff_mean = float(np.mean(k_eff_list)) if k_eff_list else 0.0
+
+        if eval_trace_path is not None and trace_action:
+            def _stack(lst, dtype=None):
+                arr = np.stack(lst, axis=0)
+                return arr.astype(dtype) if dtype is not None else arr
+            np.savez_compressed(
+                eval_trace_path,
+                env_id=_stack(trace_env_ids, np.int32),
+                episode_id=_stack(trace_ep_ids, np.int32),
+                z=_stack(trace_z, np.float16),
+                h=_stack(trace_h, np.float16),
+                logits=_stack(trace_logits, np.float16),
+                value=_stack(trace_value, np.float32),
+                mask=_stack(trace_mask, np.uint8),
+                action=_stack(trace_action, np.int32),
+                fidelity_after=_stack(trace_fid_after, np.float32),
+                reward_after=_stack(trace_rew_after, np.float32),
+                terminated=_stack(trace_term, np.uint8),
+                truncated=_stack(trace_trunc, np.uint8),
+            )
+
         return (
             succ,
             float(np.mean(fids)) if fids else 0.0,
@@ -564,6 +807,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         target_qasm = None
 
     trained = 0
+    chunk_idx = 0
     consecutive_successes = 0  # 连续成功的评估次数
 
     # profile 累积器（用差分得到“本 chunk”均值）
@@ -607,26 +851,41 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
             # on-policy：每 chunk 用干净的 buffer（最简单可靠）
             buf = VectorReplayBuffer(total_size=max(buffer_size, this_chunk * 2), buffer_num=n_train_env)
             train_collector = Collector(algorithm, train_envs, buf, exploration_noise=False)
+            train_collector.reset_env()
 
-            trainer_params = OnPolicyTrainerParams(
-                training_collector=train_collector,
-                test_collector=None,  # 我们不用 test_collector，自己 greedy_eval 更稳定
-                max_epochs=1,
-                epoch_num_steps=int(this_chunk),
-                collection_step_num_env_steps=collect_steps,
-                update_step_num_repetitions=update_reps,
-                batch_size=batch_size,
-                test_step_num_episodes=0,
-                test_in_training=False,
-            )
+            # ===== 启用 trace 缓存：collect 时自动记录 z/h/logits/mask/value =====
+            ac.enable_trace()
 
+            # 1) 采样 this_chunk 步，使用当前策略（未更新前）
             t_train_start = time.perf_counter()
-            algorithm.run_training(trainer_params)
+            train_collector.collect(n_step=int(this_chunk))
             train_chunk_time = time.perf_counter() - t_train_start
             trained += this_chunk
 
+            # ===== 禁用 trace 并取出缓存数据 =====
+            actor_cache, value_cache = ac.get_trace_cache()
+            trace_data = _merge_trace_cache(actor_cache, value_cache)
+            ac.disable_trace()
+
+            # 2) 训练 trace（直接用缓存数据，不再二次前向）
+            train_trace_path = os.path.join(
+                traces_train_dir, f"chunk_{chunk_idx:04d}_step_{trained:08d}.npz"
+            )
+            _write_train_trace_from_buffer(train_collector.buffer, trace_data, train_trace_path)
+
+            # 3) PPO 更新（重复 update_reps 次）
+            for _ in range(update_reps):
+                with policy_within_training_step(algorithm.policy):
+                    algorithm.update(train_collector.buffer, batch_size=batch_size, repeat=1)
+
+            # on-policy：更新后清空 buffer
+            train_collector.reset_buffer()
+
             # 评估
             t_eval_start = time.perf_counter()
+            eval_trace_path = os.path.join(
+                traces_eval_dir, f"chunk_{chunk_idx:04d}_step_{trained:08d}.npz"
+            )
             (
                 succ,
                 mean_F,
@@ -640,7 +899,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 p_max_mean_eval,
                 margin_mean_eval,
                 k_eff_mean_eval,
-            ) = greedy_eval()
+            ) = greedy_eval(eval_trace_path=eval_trace_path)
             eval_time = time.perf_counter() - t_eval_start
             final_fidelity = mean_F
             best_fidelity = max(best_fidelity, mean_F)
@@ -649,6 +908,25 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
             last_p_max_mean = p_max_mean_eval
             last_margin_mean = margin_mean_eval
             last_k_eff_mean = k_eff_mean_eval
+
+            # 保存 checkpoint（模型/优化器/RNG）
+            ckpt_path = os.path.join(
+                ckpt_dir, f"ckpt_chunk_{chunk_idx:04d}_step_{trained:08d}.pt"
+            )
+            optim_state = _try_get_optim_state(algorithm)
+            ckpt = {
+                "chunk_idx": chunk_idx,
+                "trained_steps": trained,
+                "ac_state_dict": ac.state_dict(),
+                "algorithm_state_dict": algorithm.state_dict(),
+                "optim_state_dict": optim_state,
+                "rng": {
+                    "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                },
+            }
+            torch.save(ckpt, ckpt_path)
 
             if (not solved) and succ > 0:
                 solved = True
@@ -768,10 +1046,31 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 }
             if sys_metrics:
                 metrics["sys"] = sys_metrics
+
+            # 索引文件：记录 trace / ckpt 路径
+            try:
+                chunk_entry = {
+                    "chunk_idx": int(chunk_idx),
+                    "trained_steps": int(trained),
+                    "train_trace": os.path.relpath(train_trace_path, logger.run_dir),
+                    "eval_trace": os.path.relpath(eval_trace_path, logger.run_dir),
+                    "ckpt": os.path.relpath(ckpt_path, logger.run_dir),
+                }
+                with open(chunks_index_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(chunk_entry, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
             logger.log_metrics(trained, metrics)
 
             if early_stop_on_success and consecutive_successes >= early_stop_consecutive:
                 break
+
+            chunk_idx += 1
+
+    except Exception as e:
+        print(f"[train] Error during training: {e}")
+        raise
     finally:
         wall_time = time.time() - t0
         # 清理
@@ -781,40 +1080,40 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         except Exception:
             pass
 
-        summary = {
-            "run_id": run_id,
-            "task_id": task.get("task_id", None),
-            "difficulty_bin": task.get("difficulty_bin", None),
-            "seed": int(seed),
-            "budget_steps": int(total_budget_steps),
-            "trained_steps": int(trained),
-            "solved": int(solved),
-            "steps_to_solve": (int(steps_to_solve) if steps_to_solve is not None else None),
-            "best_fidelity": float(best_fidelity),   # 全程最佳（跨评估轮）
-            "final_fidelity": float(final_fidelity), # 最后一次评估均值
-            "wall_time_sec": float(wall_time),
-            "time_to_solve_sec": float(t_solve) if t_solve is not None else wall_time * 10,
-            "best_qasm": best_qasm_global,
-            "solved_qasm": solved_qasm,
-            "target_qasm": target_qasm,
-            "best_gate_count": (best_stats_global or {}).get("gate_count"),
-            "best_depth": (best_stats_global or {}).get("depth"),
-            "best_cx_count": (best_stats_global or {}).get("cx_count"),
-            "best_oneq_count": (best_stats_global or {}).get("oneq_count"),
-            "mean_episode_time_sec": float(mean_episode_time),
-            "steps_per_sec": steps_per_sec if "steps_per_sec" in locals() else 0.0,  # 训练阶段
-            "env_step_time_avg_sec": env_step_time_avg if "env_step_time_avg" in locals() else 0.0,
-            "policy_infer_time_avg_sec": policy_infer_time_avg if "policy_infer_time_avg" in locals() else 0.0,
-            "update_time_avg_sec": update_time_avg if "update_time_avg" in locals() else 0.0,
-            "mask_valid_action_ratio": valid_action_ratio if "valid_action_ratio" in locals() else 0.0,
-            "illegal_action_rate": illegal_action_rate if "illegal_action_rate" in locals() else 0.0,
-            "final_entropy_mean": float(last_entropy_mean),
-            "final_p_max_mean": float(last_p_max_mean),
-            "final_margin_mean": float(last_margin_mean),
-            "final_k_eff_mean": float(last_k_eff_mean),
-        }
-        logger.log_summary(summary)
-        logger.close()
+    summary = {
+        "run_id": run_id,
+        "task_id": task.get("task_id", None),
+        "difficulty_bin": task.get("difficulty_bin", None),
+        "seed": int(seed),
+        "budget_steps": int(total_budget_steps),
+        "trained_steps": int(trained),
+        "solved": int(solved),
+        "steps_to_solve": (int(steps_to_solve) if steps_to_solve is not None else None),
+        "best_fidelity": float(best_fidelity),   # 全程最佳（跨评估轮）
+        "final_fidelity": float(final_fidelity), # 最后一次评估均值
+        "wall_time_sec": float(wall_time),
+        "time_to_solve_sec": float(t_solve) if t_solve is not None else wall_time * 10,
+        "best_qasm": best_qasm_global,
+        "solved_qasm": solved_qasm,
+        "target_qasm": target_qasm,
+        "best_gate_count": (best_stats_global or {}).get("gate_count"),
+        "best_depth": (best_stats_global or {}).get("depth"),
+        "best_cx_count": (best_stats_global or {}).get("cx_count"),
+        "best_oneq_count": (best_stats_global or {}).get("oneq_count"),
+        "mean_episode_time_sec": float(mean_episode_time),
+        "steps_per_sec": steps_per_sec if "steps_per_sec" in locals() else 0.0,  # 训练阶段
+        "env_step_time_avg_sec": env_step_time_avg if "env_step_time_avg" in locals() else 0.0,
+        "policy_infer_time_avg_sec": policy_infer_time_avg if "policy_infer_time_avg" in locals() else 0.0,
+        "update_time_avg_sec": update_time_avg if "update_time_avg" in locals() else 0.0,
+        "mask_valid_action_ratio": valid_action_ratio if "valid_action_ratio" in locals() else 0.0,
+        "illegal_action_rate": illegal_action_rate if "illegal_action_rate" in locals() else 0.0,
+        "final_entropy_mean": float(last_entropy_mean),
+        "final_p_max_mean": float(last_p_max_mean),
+        "final_margin_mean": float(last_margin_mean),
+        "final_k_eff_mean": float(last_k_eff_mean),
+    }
+    logger.log_summary(summary)
+    logger.close()
 
     return summary  # run 级最终结果（供上层汇总/排序）
 
@@ -877,7 +1176,7 @@ def summarize_metrics(records, fidelity_threshold=0.99):
         if budget > 0 and np.isfinite(wt):
             time_per_step.append(wt / budget)
     mean_time_per_step = float(np.mean(time_per_step)) if time_per_step else None
-
+    
     return {
         "n_runs": int(len(records)),
         "success_rate": success_rate,
@@ -1139,7 +1438,7 @@ def run_stage(
         scheme=scheme,
         summaries=all_summaries_sorted,
         out_dir=os.path.join(log_dir, str(suite_name)),
-    )
+            )
 
     return {
         "sample_summary": sample_summary,
@@ -1317,7 +1616,7 @@ def run_suite_all_tasks(
         scheme=scheme,
         summaries=all_summaries_sorted,
         out_dir=os.path.join(train_cfg.get("log_dir", "logs"), str(suite_name)),
-    )
+            )
 
     return {
         "tasks": tasks,
@@ -1336,9 +1635,9 @@ train_cfg: dict,
 seeds: list, 
 in_dir: str = "task_suites", 
 suite_name: str = "Final", 
-sampled_json_path: str = "Final_sampled_bin10.json",
+sampled_json_path: str = "task_suites/Final_sampled_bin10.json",
 ):
-      
+  
     device = "cuda" if torch.cuda.is_available() else "cpu"
     scheme = scheme
     
@@ -1450,6 +1749,107 @@ sampled_json_path: str = "Final_sampled_bin10.json",
 
 
 if __name__ == "__main__":
+    # main(
+    # scheme = "gate_seq", 
+    # net_cfg_list = [
+    # # ====== Tiny / Smoke ======
+    # {"name": "E055k_h64_d2",
+    #  "hid": 64, "depth": 2,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== Small ======
+    # {"name": "E118k_h128_d2",
+    #  "hid": 128, "depth": 2,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== Medium ======
+    # {"name": "E268k_h256_d2",
+    #  "hid": 256, "depth": 2,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== Depth control (only one) ======
+    # {"name": "E334k_h256_d3",
+    #  "hid": 256, "depth": 3,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== Large ======
+    # {"name": "E451k_h384_d2",
+    #  "hid": 384, "depth": 2,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== XXL ======
+    # {"name": "E599k_h384_d3",
+    #  "hid": 384, "depth": 3,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+    
+    # # ====== XL ======
+    # {"name": "E667k_h512_d2",
+    #  "hid": 512, "depth": 2,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+
+    # # ====== XXL ======
+    # {"name": "E930k_h512_d3",
+    #  "hid": 512, "depth": 3,
+    #  "act": "silu", "use_ln": True,
+    #  "dropout": 0.0, "input_dropout": 0.0,
+    #  "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
+    #  ],
+    # algo_cfg = {
+    #     "lr": 3e-4,
+    #     "gamma": 0.99,
+    #     "gae_lambda": 0.95,
+    #     "max_grad_norm": 0.5,
+    #     "eps_clip": 0.2,
+    #     "vf_coef": 0.5,
+    #     "ent_coef": 0.02,  # 比你原来的 0.01 更鼓励探索（Dev 阶段更有用）
+    #     "advantage_normalization": True,
+    #     "value_clip": False,
+    #     "return_scaling": False,
+    # }, 
+    # train_cfg= {
+    #     "n_train_env": 8, 
+    #     # 先别太大：调 bug / 看趋势用 30k~50k 更合适
+    #     "total_budget_steps": 500000, 
+    #     # 每 5k 做一次 greedy_eval（steps_to_solve 粒度也就是 5k）
+    #     "eval_every_steps": 5000,
+    #     "eval_episodes": 5, ## 不应该是1，有些参数每个espisode都不一样
+    #     # PPO rollout / update 强度：先保守，稳定优先
+    #     "collect_steps": 2048,
+    #     "update_reps": 8,
+    #     "batch_size": 256,
+    #     # buffer_size 只是下限，代码里会用 max(buffer_size, this_chunk*2) 兜底
+    #     "buffer_size": 20000,
+    #     # 需要的话你也能显式写死阈值（否则从 env 里读）
+    #     "fidelity_threshold": 0.95,
+    #     # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
+    #     "max_gates": 20,  ##最大14 1.4* 14 = 20
+    #     # 评估成功后直接提前停掉，节省预算
+    #     "early_stop_on_success": True,
+    #     # 连续成功多少次才提前停（>=1）
+    #     "early_stop_consecutive_success": 3,
+    # }, 
+    #     seeds=[0, 1, 2, 3, 4], 
+    #     in_dir="task_suites", 
+    #     suite_name="Final", 
+    #     sampled_json_path="task_suites/Final_sampled_bin10.json"
+        
+    #     )
+
+    ## 测试任务测试数据记录功能
     main(
     scheme = "gate_seq", 
     net_cfg_list = [
@@ -1467,47 +1867,7 @@ if __name__ == "__main__":
      "dropout": 0.0, "input_dropout": 0.0,
      "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-    # ====== Medium ======
-    {"name": "E268k_h256_d2",
-     "hid": 256, "depth": 2,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-    # ====== Depth control (only one) ======
-    {"name": "E334k_h256_d3",
-     "hid": 256, "depth": 3,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-
-    # ====== Large ======
-    {"name": "E451k_h384_d2",
-     "hid": 384, "depth": 2,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-
-    # ====== XXL ======
-    {"name": "E599k_h384_d3",
-     "hid": 384, "depth": 3,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-    
-    # ====== XL ======
-    {"name": "E667k_h512_d2",
-     "hid": 512, "depth": 2,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-
-    # ====== XXL ======
-    {"name": "E930k_h512_d3",
-     "hid": 512, "depth": 3,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
      ],
     algo_cfg = {
         "lr": 3e-4,
@@ -1522,18 +1882,20 @@ if __name__ == "__main__":
         "return_scaling": False,
     }, 
     train_cfg= {
-        "n_train_env": 8, 
+        # ===== 日志目录：本次测试专用 =====
+        "log_dir": "logs_trace_inline",
+        "n_train_env": 2, 
         # 先别太大：调 bug / 看趋势用 30k~50k 更合适
-        "total_budget_steps": 500000, 
+        "total_budget_steps": 1024, 
         # 每 5k 做一次 greedy_eval（steps_to_solve 粒度也就是 5k）
-        "eval_every_steps": 5000,
-        "eval_episodes": 5, ## 不应该是1，有些参数每个espisode都不一样
+        "eval_every_steps": 512,
+        "eval_episodes": 2, # 评估 episode 数
         # PPO rollout / update 强度：先保守，稳定优先
         "collect_steps": 2048,
         "update_reps": 8,
         "batch_size": 256,
         # buffer_size 只是下限，代码里会用 max(buffer_size, this_chunk*2) 兜底
-        "buffer_size": 20000,
+        "buffer_size": 1024,
         # 需要的话你也能显式写死阈值（否则从 env 里读）
         "fidelity_threshold": 0.95,
         # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
@@ -1543,9 +1905,9 @@ if __name__ == "__main__":
         # 连续成功多少次才提前停（>=1）
         "early_stop_consecutive_success": 3,
     }, 
-        seeds=[0, 1, 2, 3, 4], 
+        seeds=[0, 1], 
         in_dir="task_suites", 
         suite_name="Final", 
-        sampled_json_path="task_suites/Final_sampled_bin10.json"
+        sampled_json_path="task_suites/Final_sampled_bin5.json"
         
-        )    
+        )
