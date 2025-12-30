@@ -64,7 +64,7 @@ class CircuitDesignerDiscrete(gym.Env):
             "illegal_count": 0,
             "mask_valid_sum": 0.0,
             "mask_calls": 0,
-        }
+        } ## 环境性能统计
         
 
         self._qc = QuantumCircuit(self.n_qubits)
@@ -611,4 +611,5 @@ class CircuitDesignerDiscrete(gym.Env):
 register(
     id='CircuitDesigner-Discrete-v1',
     entry_point='env:CircuitDesignerDiscrete',
+
 )
