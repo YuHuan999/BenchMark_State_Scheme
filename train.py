@@ -50,26 +50,54 @@ def _try_get_optim_state(algorithm):
     return None
 
 
-def _merge_trace_cache(actor_cache, value_cache):
+def _merge_trace_cache(actor_cache, value_cache, ac=None, buffer=None):
     """
     把 ActorCritic.trace_actor_cache / trace_value_cache 合并成 (z, h, logits, mask, value) numpy 数组。
     actor_cache: list of (z, h, logits, mask)，每项 shape=[B, ...]
     value_cache: list of value，每项 shape=[B]
+    ac: ActorCritic 实例，用于在 value_cache 为空时通过 h 直接计算 value
+    buffer: VectorReplayBuffer（未使用，保留接口兼容）
     返回：(z, h, logits, mask, value)，每项 shape=[total_steps, ...]
+    
+    注意：logits 会被 clip 到 float16 安全范围 [-65500, 65500]，避免 -inf 溢出。
     """
     if not actor_cache:
         return None, None, None, None, None
 
-    z_all = torch.cat([item[0] for item in actor_cache], dim=0).numpy()
-    h_all = torch.cat([item[1] for item in actor_cache], dim=0).numpy()
-    logits_all = torch.cat([item[2] for item in actor_cache], dim=0).numpy()
-    mask_all = torch.cat([item[3] for item in actor_cache], dim=0).numpy()
+    # 先合并为 tensor
+    z_cat = torch.cat([item[0] for item in actor_cache], dim=0)
+    h_cat = torch.cat([item[1] for item in actor_cache], dim=0)
+    logits_cat = torch.cat([item[2] for item in actor_cache], dim=0)
+    mask_cat = torch.cat([item[3] for item in actor_cache], dim=0)
+    
+    z_all = z_cat.numpy()
+    h_all = h_cat.numpy()
+    logits_all = logits_cat.numpy()
+    mask_all = mask_cat.numpy()
+    
+    # P0 修复：clip logits 到 float16 安全范围，避免 -inf 溢出
+    # float16 范围是 [-65504, 65504]，留一点余量
+    logits_all = np.clip(logits_all, -65500, 65500)
 
-    if value_cache:
+    if value_cache and len(value_cache) > 0:
         value_all = torch.cat(value_cache, dim=0).numpy()
     else:
-        # 如果 critic 没有被调用（不太可能），填充 0
-        value_all = np.zeros(z_all.shape[0], dtype=np.float32)
+        # P0 修复：如果 value_cache 为空（PPO collect 时 critic 不单独调用），
+        # 直接用已有的 h（feat）通过 critic_head 计算 value，避免重新 forward encoder
+        if ac is not None and hasattr(ac, "critic_head"):
+            try:
+                with torch.no_grad():
+                    # h_cat 已经是 CPU tensor，需要移到正确的设备
+                    device = next(ac.parameters()).device
+                    h_device = h_cat.to(device)
+                    value_tensor = ac.critic_head(h_device).squeeze(-1)
+                    value_all = value_tensor.cpu().numpy().astype(np.float32)
+            except Exception as e:
+                print(f"[warn] Failed to compute value from h: {e}")
+                value_all = np.zeros(z_all.shape[0], dtype=np.float32)
+        else:
+            # 没有 ac，填充 0
+            value_all = np.zeros(z_all.shape[0], dtype=np.float32)
 
     return z_all, h_all, logits_all, mask_all, value_all
 
@@ -561,6 +589,10 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 break
 
     def wrapped_update(*args, **kwargs):
+        """
+        P1 修复：正确捕获 PPO 训练统计信息。
+        Tianshou PPO.update() 返回 TrainingStats 对象，需要调用 get_loss_stats_dict() 获取 dict。
+        """
         t_start = time.perf_counter()
         res = orig_update(*args, **kwargs)
         algorithm.profile_update_time += time.perf_counter() - t_start
@@ -569,17 +601,26 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         res_dict = None
         if isinstance(res, dict):
             res_dict = res
-        elif hasattr(res, "__dict__") and isinstance(res.__dict__, dict):
+        elif hasattr(res, "get_loss_stats_dict"):
+            # P1 修复：Tianshou TrainingStats 使用 get_loss_stats_dict() 方法
+            try:
+                res_dict = res.get_loss_stats_dict()
+            except Exception:
+                pass
+        
+        # 备选：尝试直接访问属性（适用于旧版本 Tianshou）
+        if res_dict is None and hasattr(res, "__dict__"):
             res_dict = res.__dict__
 
-        if res_dict is not None:
+        if res_dict is not None and isinstance(res_dict, dict) and len(res_dict) > 0:
             algorithm.profile_ppo_stats_n += 1
-            _acc_stat(res_dict, ["approx_kl", "kl", "policy_kl", "train/approx_kl"], "approx_kl")
-            _acc_stat(res_dict, ["clipfrac", "clip_frac", "policy_clipfrac"], "clipfrac")
-            _acc_stat(res_dict, ["entropy", "ent", "policy_entropy"], "entropy")
-            _acc_stat(res_dict, ["loss", "total_loss"], "loss_total")
-            _acc_stat(res_dict, ["actor_loss", "pi_loss"], "loss_actor")
-            _acc_stat(res_dict, ["critic_loss", "vf_loss"], "loss_critic")
+            # 更全面的 key 别名，适配 Tianshou 不同版本
+            _acc_stat(res_dict, ["approx_kl", "kl", "policy_kl", "train/approx_kl", "loss/kl"], "approx_kl")
+            _acc_stat(res_dict, ["clipfrac", "clip_frac", "policy_clipfrac", "clip_fraction", "loss/clip"], "clipfrac")
+            _acc_stat(res_dict, ["entropy", "ent", "policy_entropy", "ent_loss", "loss/ent"], "entropy")
+            _acc_stat(res_dict, ["loss", "total_loss", "loss/total"], "loss_total")
+            _acc_stat(res_dict, ["actor_loss", "pi_loss", "loss/actor", "policy_loss"], "loss_actor")
+            _acc_stat(res_dict, ["critic_loss", "vf_loss", "loss/critic", "value_loss", "loss/vf"], "loss_critic")
         return res
 
     algorithm.update = wrapped_update
@@ -712,7 +753,8 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                 trace_ep_ids.append(ep)
                 trace_z.append(z_np.astype(np.float16))
                 trace_h.append(h_np.astype(np.float16))
-                trace_logits.append(logits_np.astype(np.float16))
+                # P0 修复：clip logits 到 float16 安全范围，避免 -inf 溢出
+                trace_logits.append(np.clip(logits_np, -65500, 65500).astype(np.float16))
                 trace_value.append(value_np)
                 trace_mask.append(mask_np.astype(np.uint8))
                 trace_action.append(a)
@@ -810,18 +852,27 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     chunk_idx = 0
     consecutive_successes = 0  # 连续成功的评估次数
 
-    # profile 累积器（用差分得到“本 chunk”均值）
+    # profile 累积器（用差分得到"本 chunk"均值）
     def _env_profile_snapshot():
+        """
+        P1 修复：使用 train_envs.get_env_attr("profile") 正确获取所有子环境的 profile。
+        DummyVectorEnv 不直接暴露 envs 属性，需要使用 get_env_attr 方法。
+        """
         stats = dict(env_step_time=0.0, env_step_calls=0, illegal_count=0, mask_valid_sum=0.0, mask_calls=0)
-        for e in getattr(train_envs, "envs", []):
-            prof = getattr(e, "profile", None)
-            if not prof:
-                continue
-            stats["env_step_time"] += float(prof.get("env_step_time", 0.0))
-            stats["env_step_calls"] += int(prof.get("env_step_calls", 0))
-            stats["illegal_count"] += int(prof.get("illegal_count", 0))
-            stats["mask_valid_sum"] += float(prof.get("mask_valid_sum", 0.0))
-            stats["mask_calls"] += int(prof.get("mask_calls", 0))
+        try:
+            # 使用 Tianshou VectorEnv 的正确 API 获取所有子环境的 profile
+            profiles = train_envs.get_env_attr("profile")  # 返回 list[dict]
+            for prof in profiles:
+                if not prof or not isinstance(prof, dict):
+                    continue
+                stats["env_step_time"] += float(prof.get("env_step_time", 0.0))
+                stats["env_step_calls"] += int(prof.get("env_step_calls", 0))
+                stats["illegal_count"] += int(prof.get("illegal_count", 0))
+                stats["mask_valid_sum"] += float(prof.get("mask_valid_sum", 0.0))
+                stats["mask_calls"] += int(prof.get("mask_calls", 0))
+        except Exception as e:
+            # 如果获取失败，返回默认值
+            pass
         return stats
 
     prev_env_prof = _env_profile_snapshot()
@@ -864,7 +915,8 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
 
             # ===== 禁用 trace 并取出缓存数据 =====
             actor_cache, value_cache = ac.get_trace_cache()
-            trace_data = _merge_trace_cache(actor_cache, value_cache)
+            # P0 修复：传入 ac 和 buffer，以便在 value_cache 为空时重新计算 value
+            trace_data = _merge_trace_cache(actor_cache, value_cache, ac=ac, buffer=train_collector.buffer)
             ac.disable_trace()
 
             # 2) 训练 trace（直接用缓存数据，不再二次前向）
@@ -1886,7 +1938,7 @@ if __name__ == "__main__":
         "log_dir": "logs_trace_inline",
         "n_train_env": 2, 
         # 先别太大：调 bug / 看趋势用 30k~50k 更合适
-        "total_budget_steps": 1024, 
+        "total_budget_steps": 10240, 
         # 每 5k 做一次 greedy_eval（steps_to_solve 粒度也就是 5k）
         "eval_every_steps": 512,
         "eval_episodes": 2, # 评估 episode 数
