@@ -52,7 +52,8 @@ def _try_get_optim_state(algorithm):
 
 def _merge_trace_cache(actor_cache, value_cache, ac=None, buffer=None):
     """
-    把 ActorCritic.trace_actor_cache / trace_value_cache 合并成 (z, h, logits, mask, value) numpy 数组。
+    把 ActorCritic.trace_actor_cache / trace_value_cache 合并成 
+    (z, h, logits, mask, value) numpy 数组。
     actor_cache: list of (z, h, logits, mask)，每项 shape=[B, ...]
     value_cache: list of value，每项 shape=[B]
     ac: ActorCritic 实例，用于在 value_cache 为空时通过 h 直接计算 value
@@ -485,6 +486,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     # 2) 构建并行训练 env（同一个任务，不同 seed）
     # -----------------------
     fidelity_threshold_cfg = float(train_cfg.get("fidelity_threshold", 0.99))
+    # ⚠️ 正式实验时建议设置 early_stop_on_success=False，避免影响电路质量优化
     early_stop_on_success = bool(train_cfg.get("early_stop_on_success", True))
     early_stop_consecutive = int(train_cfg.get("early_stop_consecutive_success", 1))
     early_stop_consecutive = max(1, early_stop_consecutive)
@@ -837,6 +839,9 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     final_fidelity = -1.0
     best_stats_global = None
     best_qasm_global = None
+    # 追踪达到目标的最短电路（按 gate_count 最小）
+    min_stats_global = None
+    min_qasm_global = None
     t_solve = None  # 记录首次成功（解出目标）的耗时
     solved_qasm = None
     # 记录目标电路的 qasm 便于对比
@@ -995,6 +1000,12 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
             if succ > 0 and best_stats_candidate is not None:
                 best_stats_global = best_stats_candidate
                 best_qasm_global = solved_qasm_candidate
+                # 更新最短电路：只有门数更少时才更新
+                current_gc = best_stats_candidate.get("gate_count", float('inf'))
+                min_gc = (min_stats_global or {}).get("gate_count", float('inf'))
+                if current_gc < min_gc:
+                    min_stats_global = best_stats_candidate
+                    min_qasm_global = solved_qasm_candidate
 
             # profile 增量
             env_prof = _env_profile_snapshot()
@@ -1062,11 +1073,14 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                     "margin_mean": margin_mean_eval,
                     "k_eff_mean": k_eff_mean_eval,
                 },
-                "circuit": {  # 最优电路结构
+                "circuit": {  # 本次评估的电路结构
                     "gate_count": circuit_stats_log.get("gate_count"),
                     "depth": circuit_stats_log.get("depth"),
                     "cx_count": circuit_stats_log.get("cx_count"),
                     "oneq_count": circuit_stats_log.get("oneq_count"),
+                    # 历史最短电路（按 gate_count 最小）
+                    "min_gate_count_so_far": (min_stats_global or {}).get("gate_count"),
+                    "min_depth_so_far": (min_stats_global or {}).get("depth"),
                 },
                 "time": {  # 本 chunk 训练/评估耗时
                     "train_chunk_sec": train_chunk_time,
@@ -1115,6 +1129,9 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
 
             logger.log_metrics(trained, metrics)
 
+            # ⚠️ 注意：正式实验时建议禁用早停（设置 early_stop_on_success=False）
+            # 早停虽然节省训练预算，但可能在神经网络"刚学会完成任务"时就停止，
+            # 错过后续"学会用更短电路完成任务"的阶段，从而削弱电路质量表现。
             if early_stop_on_success and consecutive_successes >= early_stop_consecutive:
                 break
 
@@ -1152,6 +1169,12 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         "best_depth": (best_stats_global or {}).get("depth"),
         "best_cx_count": (best_stats_global or {}).get("cx_count"),
         "best_oneq_count": (best_stats_global or {}).get("oneq_count"),
+        # 达到目标的最短电路统计（按 gate_count 最小）
+        "min_gate_count": (min_stats_global or {}).get("gate_count"),
+        "min_depth": (min_stats_global or {}).get("depth"),
+        "min_cx_count": (min_stats_global or {}).get("cx_count"),
+        "min_oneq_count": (min_stats_global or {}).get("oneq_count"),
+        "min_qasm": min_qasm_global,
         "mean_episode_time_sec": float(mean_episode_time),
         "steps_per_sec": steps_per_sec if "steps_per_sec" in locals() else 0.0,  # 训练阶段
         "env_step_time_avg_sec": env_step_time_avg if "env_step_time_avg" in locals() else 0.0,
@@ -1961,5 +1984,4 @@ if __name__ == "__main__":
         in_dir="task_suites", 
         suite_name="Final", 
         sampled_json_path="task_suites/Final_sampled_bin5.json"
-        
         )
