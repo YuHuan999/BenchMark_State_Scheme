@@ -86,4 +86,5 @@ if __name__ == "__main__":
         per_bin=args.per_bin,
         seed=args.seed,
         out_path=args.out_path,
+        
     )
