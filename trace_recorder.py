@@ -108,5 +108,6 @@ def rollout_trace(env, ac, device, mode, episodes, seed_base, out_path):
         "terminated": _stack(term_list, np.uint8),
         "truncated": _stack(trunc_list, np.uint8),
     }
+    
     np.savez_compressed(out_path, **out)
     return {"episodes": episodes, "steps": len(act_list), "path": out_path}
