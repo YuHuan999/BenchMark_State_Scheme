@@ -31,7 +31,7 @@ from tianshou.trainer import OnPolicyTrainerParams
 from env import CircuitDesignerDiscrete
 from generate_task_suite.prepare_tasks import load_task_suite
 from wrapper_represent import RepresentationWrapper
-from encoders.encoder_MLP import Encoder_MLP
+from encoders.encoders_factory import build_encoder
 from trace_recorder import infer_step, rollout_trace
 
 from typing import Dict, List, Tuple, Any
@@ -531,7 +531,7 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     # -----------------------
     # 3) build network（只依赖 net_cfg）
     # -----------------------
-    encoder = Encoder_MLP.from_cfg(actions=actions, max_gates=max_gates, cfg=net_cfg).to(device)
+    encoder = build_encoder(actions=actions, max_gates=max_gates, net_cfg=net_cfg).to(device)
     enc_out = int(getattr(encoder, "out_dim", net_cfg.get("out_dim", 256)))
     use_ln = bool(net_cfg.get("use_ln", True))
     shared_act = str(net_cfg.get("shared_act", "silu"))
