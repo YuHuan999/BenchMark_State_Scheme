@@ -150,6 +150,7 @@ class Encoder_GIN(nn.Module):
         add_self_loops: bool = True,
         norm: str = "ln",
         dropout: float = 0.0,
+        use_post_block: bool = True,
         post_ln: bool = False,
         post_act: str = "relu",
         post_dropout: float = 0.0,
@@ -158,12 +159,12 @@ class Encoder_GIN(nn.Module):
         
         self.actions = actions
         self.max_gates = int(max_gates)
-        self.out_dim = int(out_dim)
         self.hid = int(hid)
         self.depth = int(depth)
         self.readout = readout.lower()
         self.use_undirected = bool(use_undirected)
         self.add_self_loops = bool(add_self_loops)
+        self.use_post_block = bool(use_post_block)
         
         assert self.readout in ("mean", "sum"), f"readout must be 'mean' or 'sum', got {readout}"
         
@@ -187,36 +188,77 @@ class Encoder_GIN(nn.Module):
                 )
             )
         
-        # 输出投影：hid -> out_dim
-        if hid != out_dim:
-            self.out_proj = nn.Linear(hid, out_dim)
+        # 输出投影 + Post processing（可选）
+        # use_post_block=False 时跳过 out_proj 和 post，直接输出 hid 维度
+        # 这样可以让 SharedMLP 负责后续处理，避免冗余
+        if use_post_block:
+            self.out_dim = int(out_dim)
+            
+            # 输出投影：hid -> out_dim
+            if hid != out_dim:
+                self.out_proj = nn.Linear(hid, out_dim)
+            else:
+                self.out_proj = nn.Identity()
+            
+            # Post processing block (与 Encoder_RNN 对齐)
+            # 顺序：LayerNorm -> activation -> Dropout
+            post_act_lower = (post_act or "none").lower()
+            has_post = post_ln or (post_act_lower != "none") or (post_dropout > 0)
+            
+            if has_post:
+                post_layers = []
+                if post_ln:
+                    post_layers.append(nn.LayerNorm(out_dim))
+                if post_act_lower != "none":
+                    post_layers.append(_make_activation(post_act))
+                if post_dropout > 0:
+                    post_layers.append(nn.Dropout(p=post_dropout))
+                self.post = nn.Sequential(*post_layers)
+            else:
+                self.post = None
         else:
-            self.out_proj = nn.Identity()
-        
-        # Post processing block (与 Encoder_RNN 对齐)
-        # 顺序：LayerNorm -> activation -> Dropout
-        post_act_lower = (post_act or "none").lower()
-        has_post = post_ln or (post_act_lower != "none") or (post_dropout > 0)
-        
-        if has_post:
-            post_layers = []
-            if post_ln:
-                post_layers.append(nn.LayerNorm(out_dim))
-            if post_act_lower != "none":
-                post_layers.append(_make_activation(post_act))
-            if post_dropout > 0:
-                post_layers.append(nn.Dropout(p=post_dropout))
-            self.post = nn.Sequential(*post_layers)
-        else:
+            # 不使用 post block，直接输出 hid 维度
+            self.out_dim = int(hid)
+            self.out_proj = None
             self.post = None
-    
+
+    @property
+    def num_params(self) -> int:
+        """
+        返回可训练参数总数。
+        
+        注意：由于使用了 LazyLinear，需要先调用一次 forward 初始化模型。
+        此方法会跳过未初始化的 LazyModule 参数，只计算已初始化的部分。
+        """
+        total = 0
+        has_uninitialized = False
+        
+        for p in self.parameters():
+            if not p.requires_grad:
+                continue
+            try:
+                total += p.numel()
+            except ValueError:
+                # UninitializedParameter from LazyModule
+                has_uninitialized = True
+        
+        if has_uninitialized:
+            import warnings
+            warnings.warn(
+                "GIN encoder has uninitialized LazyLinear. "
+                "The returned count only includes initialized parameters. "
+                "Call forward() with a dummy batch to initialize."
+            )
+        
+        return total
+
     @classmethod
     def from_cfg(cls, *, actions, max_gates: int, cfg: dict):
         """
         工厂方法，接口与 Encoder_MLP.from_cfg 完全对齐。
         
         cfg 字段说明：
-        - out_dim: encoder 输出维度（默认 256）
+        - out_dim: encoder 输出维度（默认 256，仅 use_post_block=True 时生效）
         - hid: GIN 的 node hidden dim（默认 128）
         - depth: GIN 层数（默认 3）
         - mlp_depth: 每层 GIN 内部 MLP 的深度（默认 2）
@@ -227,7 +269,11 @@ class Encoder_GIN(nn.Module):
         - add_self_loops: 是否给 A 加单位阵（默认 True）
         - norm: "ln" / "bn" / "none"（默认 "ln"）
         - dropout: 默认 0.0
-        - post_ln: 是否在输出后加 LayerNorm（默认 False）
+        - use_post_block: 是否使用 out_proj + post（默认 True）
+            - True: 使用 out_proj 投影到 out_dim，并应用 post 处理，out_dim = out_dim
+            - False: 跳过 out_proj 和 post，直接输出 pooled 特征，out_dim = hid
+                     适合让 SharedMLP 负责后续处理，避免冗余
+        - post_ln: 是否在输出后加 LayerNorm（默认 False，仅 use_post_block=True 时生效）
         - post_act: 输出后的激活函数（默认 "relu"，可设 "none" 禁用）
         - post_dropout: 输出后的 dropout（默认 0.0）
         """
@@ -252,6 +298,7 @@ class Encoder_GIN(nn.Module):
             add_self_loops=bool(cfg.get("add_self_loops", True)),
             norm=str(cfg.get("norm", "ln")),
             dropout=float(cfg.get("dropout", 0.0)),
+            use_post_block=bool(cfg.get("use_post_block", True)),
             post_ln=bool(cfg.get("post_ln", False)),
             post_act=str(cfg.get("post_act", "relu")),
             post_dropout=float(cfg.get("post_dropout", 0.0)),
@@ -417,15 +464,19 @@ class Encoder_GIN(nn.Module):
             H_masked = H * mask_expanded
             pooled = H_masked.sum(dim=1)  # [B, hid]
         
-        # 输出投影
-        z = self.out_proj(pooled)  # [B, out_dim]
-        
-        # Post processing (LayerNorm -> activation -> Dropout)
-        if self.post is not None:
-            z = self.post(z)
+        # 输出投影 + Post processing（可选）
+        if self.use_post_block:
+            z = self.out_proj(pooled)  # [B, out_dim]
+            
+            # Post processing (LayerNorm -> activation -> Dropout)
+            if self.post is not None:
+                z = self.post(z)
+        else:
+            # 不使用 post block，直接输出 pooled 特征 [B, hid]
+            z = pooled
         
         # 处理完全空的样本（mask_sum = 0）
-        # 必须在 post 之后处理，因为 Linear/LayerNorm 都有可学习 bias
+        # 必须在最后处理，因为 Linear/LayerNorm 都有可学习 bias
         empty_mask = (mask_sum.squeeze(-1) == 0)  # [B]
         if empty_mask.any():
             z = torch.where(
@@ -568,6 +619,28 @@ if __name__ == "__main__":
     assert not (z8[3] == 0).all(), "Sample 3 (non-empty) should not be all zeros"
     print(f"Output: z={z8.shape}, empty samples [0,2] are zeros, non-empty [1,3] are non-zero")
     print("[PASS] Test 8")
+    
+    # Test 9: use_post_block=False (skip out_proj + post, output hid dim)
+    print("\n--- Test 9: use_post_block=False ---")
+    cfg_no_postblock = {
+        "hid": 64,
+        "depth": 2,
+        "out_dim": 256,  # This should be ignored when use_post_block=False
+        "use_post_block": False,
+    }
+    encoder_no_postblock = Encoder_GIN.from_cfg(actions=actions, max_gates=max_gates, cfg=cfg_no_postblock)
+    # out_dim should be hid (64) when use_post_block=False
+    assert encoder_no_postblock.out_dim == 64, f"Expected out_dim=64 (hid), got {encoder_no_postblock.out_dim}"
+    assert encoder_no_postblock.out_proj is None, "out_proj should be None when use_post_block=False"
+    assert encoder_no_postblock.post is None, "post should be None when use_post_block=False"
+    z9 = encoder_no_postblock({"state": {"x": X, "a": A, "mask": mask}})
+    assert z9.shape == (B, 64), f"Expected ({B}, 64), got {z9.shape}"
+    # Also verify empty graph works
+    z9_empty = encoder_no_postblock({"state": {"x": X, "a": A, "mask": mask_zero}})
+    assert (z9_empty == 0).all(), "Expected all zeros for empty graph"
+    print(f"Output: z={z9.shape}, out_dim={encoder_no_postblock.out_dim} (=hid)")
+    print(f"  out_proj=None, post=None, empty graph zeros: {(z9_empty == 0).all().item()}")
+    print("[PASS] Test 9 (use_post_block=False, let SharedMLP handle post-processing)")
     
     print("\n" + "=" * 60)
     print("All self-tests passed!")

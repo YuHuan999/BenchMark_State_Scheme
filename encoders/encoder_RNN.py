@@ -50,7 +50,7 @@ class Encoder_RNN(nn.Module):
         pool: str = "last",
         out_dim: int | None = None,
         post_ln: bool = False,
-        post_act: str = "relu",
+        post_act: str = "none",
         post_dropout: float = 0.0,
     ):
         super().__init__()
@@ -134,7 +134,12 @@ class Encoder_RNN(nn.Module):
             post_layers.append(nn.Dropout(p=post_dropout))
         
         self.post = nn.Sequential(*post_layers) if post_layers else None
-    
+
+    @property
+    def num_params(self) -> int:
+        """返回可训练参数总数"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
     @classmethod
     def from_cfg(cls, *, actions, max_gates: int, cfg: dict):
         """

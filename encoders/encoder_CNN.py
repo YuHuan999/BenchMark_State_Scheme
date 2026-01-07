@@ -43,7 +43,7 @@ class Encoder_CNN(nn.Module):
     输出：[B, out_dim]
     
     参数：
-        out_dim: 输出维度（默认 256）
+        out_dim: 输出维度（默认 256，仅在 use_proj=True 时生效）
         hid: 隐藏层通道数（默认 64）
         depth: CNN 层数（默认 3）
         kernel_size: 卷积核大小（默认 3）
@@ -51,6 +51,9 @@ class Encoder_CNN(nn.Module):
         act: 激活函数（默认 "relu"）
         grid_encoding: grid 分支的编码方式，"scalar" 或 "onehot"（默认 "scalar"）
         mode: 输入模式，"auto" | "grid" | "tensor"（默认 "auto"）
+        use_proj: 是否使用投影层（默认 True）
+                  - True: 使用 Linear(hid -> out_dim) 投影，输出维度为 out_dim
+                  - False: 不使用投影层，输出维度为 hid（由外部 sharedMLP 处理）
     """
     
     def __init__(
@@ -64,10 +67,10 @@ class Encoder_CNN(nn.Module):
         act: str = "relu",
         grid_encoding: str = "scalar",
         mode: str = "auto",
+        use_proj: bool = True,
     ):
         super().__init__()
         
-        self.out_dim = int(out_dim)
         self.hid = int(hid)
         self.depth = int(depth)
         self.kernel_size = int(kernel_size)
@@ -75,6 +78,14 @@ class Encoder_CNN(nn.Module):
         self.act_name = act
         self.grid_encoding = grid_encoding.lower()
         self.mode = mode.lower()
+        self.use_proj = bool(use_proj)
+        
+        # out_dim 取决于是否使用投影层
+        if self.use_proj:
+            self.out_dim = int(out_dim)
+        else:
+            # 不使用投影层时，输出维度就是 hid
+            self.out_dim = self.hid
         
         assert self.grid_encoding in ("scalar", "onehot"), \
             f"grid_encoding must be 'scalar' or 'onehot', got {grid_encoding}"
@@ -122,7 +133,12 @@ class Encoder_CNN(nn.Module):
                 grid_layers.append(nn.Dropout(p=self.dropout))
         
         self.grid_backbone = nn.Sequential(*grid_layers)
-        self.grid_proj = nn.Linear(self.hid, self.out_dim)
+        
+        # 投影层（可选）
+        if self.use_proj:
+            self.grid_proj = nn.Linear(self.hid, self.out_dim)
+        else:
+            self.grid_proj = None
     
     def _build_tensor_branch(self):
         """构建 tensor 分支的 2D CNN"""
@@ -150,8 +166,43 @@ class Encoder_CNN(nn.Module):
                 tensor_layers.append(nn.Dropout(p=self.dropout))
         
         self.tensor_backbone = nn.Sequential(*tensor_layers)
-        self.tensor_proj = nn.Linear(self.hid, self.out_dim)
-    
+        
+        # 投影层（可选）
+        if self.use_proj:
+            self.tensor_proj = nn.Linear(self.hid, self.out_dim)
+        else:
+            self.tensor_proj = None
+
+    @property
+    def num_params(self) -> int:
+        """
+        返回可训练参数总数。
+        
+        注意：由于使用了 LazyConv，需要先调用一次 forward 初始化模型。
+        此方法会跳过未初始化的 LazyModule 参数，只计算已初始化的部分。
+        """
+        total = 0
+        has_uninitialized = False
+        
+        for p in self.parameters():
+            if not p.requires_grad:
+                continue
+            try:
+                total += p.numel()
+            except ValueError:
+                # UninitializedParameter from LazyModule
+                has_uninitialized = True
+        
+        if has_uninitialized:
+            import warnings
+            warnings.warn(
+                "CNN encoder has uninitialized LazyConv modules. "
+                "The returned count only includes initialized parameters. "
+                "Call forward() with appropriate input to initialize all branches."
+            )
+        
+        return total
+
     @classmethod
     def from_cfg(cls, net_cfg: dict):
         """
@@ -167,6 +218,7 @@ class Encoder_CNN(nn.Module):
             "act": "relu",
             "grid_encoding": "scalar",
             "mode": "auto",
+            "use_proj": True,  # 是否使用投影层
         }
         """
         cfg = dict(net_cfg or {})
@@ -179,6 +231,7 @@ class Encoder_CNN(nn.Module):
             act=str(cfg.get("act", "relu")),
             grid_encoding=str(cfg.get("grid_encoding", "scalar")),
             mode=str(cfg.get("mode", "auto")),
+            use_proj=bool(cfg.get("use_proj", True)),
         )
     
     def _detect_input_type(self, x: torch.Tensor) -> str:
@@ -323,8 +376,11 @@ class Encoder_CNN(nn.Module):
                 pooled
             )
         
-        # 投影到 out_dim
-        return self.grid_proj(pooled)  # [B, out_dim]
+        # 投影到 out_dim（如果启用）
+        if self.use_proj:
+            return self.grid_proj(pooled)  # [B, out_dim]
+        else:
+            return pooled  # [B, hid]
     
     def _grid_onehot_encode(self, x: torch.Tensor, pad_q: int) -> torch.Tensor:
         """
@@ -421,8 +477,11 @@ class Encoder_CNN(nn.Module):
                 pooled
             )
         
-        # 投影到 out_dim
-        return self.tensor_proj(pooled)  # [B, out_dim]
+        # 投影到 out_dim（如果启用）
+        if self.use_proj:
+            return self.tensor_proj(pooled)  # [B, out_dim]
+        else:
+            return pooled  # [B, hid]
 
 
 def build_encoder_cnn(actions, max_gates: int, net_cfg: dict | None = None) -> Encoder_CNN:
@@ -608,6 +667,43 @@ if __name__ == "__main__":
     print(f"Output shape: {out_factory.shape}")
     assert out_factory.shape == (2, 64), f"Expected (2, 64), got {out_factory.shape}"
     print("[PASS] Test 9")
+    
+    # ========== use_proj=False Test ==========
+    print("\n" + "=" * 40)
+    print("use_proj=False Test")
+    print("=" * 40)
+    
+    print("\n--- Test 10: use_proj=False (Grid) ---")
+    cfg_no_proj = {
+        "hid": 128,
+        "depth": 2,
+        "use_proj": False,  # no projection layer
+    }
+    encoder_no_proj = Encoder_CNN.from_cfg(cfg_no_proj)
+    print(f"use_proj: {encoder_no_proj.use_proj}")
+    print(f"hid: {encoder_no_proj.hid}")
+    print(f"out_dim: {encoder_no_proj.out_dim}")
+    assert encoder_no_proj.out_dim == 128, f"Expected out_dim=hid=128, got {encoder_no_proj.out_dim}"
+    assert encoder_no_proj.grid_proj is None, "grid_proj should be None when use_proj=False"
+    assert encoder_no_proj.tensor_proj is None, "tensor_proj should be None when use_proj=False"
+    
+    out_no_proj_grid = encoder_no_proj(grid_input)
+    print(f"Grid output shape: {out_no_proj_grid.shape}")
+    assert out_no_proj_grid.shape == (2, 128), f"Expected (2, 128), got {out_no_proj_grid.shape}"
+    print("[PASS] Test 10")
+    
+    print("\n--- Test 11: use_proj=False (Tensor) ---")
+    out_no_proj_tensor = encoder_no_proj(tensor_input)
+    print(f"Tensor output shape: {out_no_proj_tensor.shape}")
+    assert out_no_proj_tensor.shape == (2, 128), f"Expected (2, 128), got {out_no_proj_tensor.shape}"
+    print("[PASS] Test 11")
+    
+    print("\n--- Test 12: use_proj=False (Empty circuit) ---")
+    out_no_proj_empty = encoder_no_proj(empty_grid)
+    print(f"Empty circuit output shape: {out_no_proj_empty.shape}")
+    assert out_no_proj_empty.shape == (2, 128), f"Expected (2, 128), got {out_no_proj_empty.shape}"
+    assert (out_no_proj_empty == 0).all(), "Empty circuit should output all zeros!"
+    print("[PASS] Test 12")
     
     print("\n" + "=" * 60)
     print("All sanity checks passed!")

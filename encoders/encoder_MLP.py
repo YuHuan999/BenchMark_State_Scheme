@@ -87,6 +87,11 @@ class Encoder_MLP(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
+    @property
+    def num_params(self) -> int:
+        """返回可训练参数总数"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
     @classmethod
     def from_cfg(cls, *, actions, max_gates: int, cfg: dict):
         """
