@@ -154,6 +154,7 @@ class Encoder_GIN(nn.Module):
         post_ln: bool = False,
         post_act: str = "relu",
         post_dropout: float = 0.0,
+        n_qubits: int | None = None,
     ):
         super().__init__()
         
@@ -165,6 +166,29 @@ class Encoder_GIN(nn.Module):
         self.use_undirected = bool(use_undirected)
         self.add_self_loops = bool(add_self_loops)
         self.use_post_block = bool(use_post_block)
+        
+        # ===== Flat vector unpacking 参数（与 RepresentationWrapper.graph 对齐）=====
+        # 如果 n_qubits 未指定，尝试从 actions 推断
+        if n_qubits is None:
+            # 从 actions 中推断 n_qubits（找最大的 target/control 值）
+            max_qubit = 0
+            for a in (actions or []):
+                if isinstance(a, dict):
+                    max_qubit = max(max_qubit, a.get("target", 0) or 0)
+                    max_qubit = max(max_qubit, a.get("control", 0) or 0)
+            n_qubits = max_qubit + 1 if max_qubit > 0 else 4  # 默认 4 qubits
+        
+        self.n_qubits = int(n_qubits)
+        
+        # 与 RepresentationWrapper.graph scheme 对齐的参数
+        self.graph_K = 8  # gate type one-hot 维度 (H,X,Y,Z,T,CNOT,START,END)
+        self.graph_F = self.graph_K + 2 * self.n_qubits  # 节点特征维度
+        self.graph_Vmax = self.max_gates + 2  # 最大节点数（含 START/END）
+        self.graph_state_dim = (
+            self.graph_Vmax * self.graph_F +     # X_pad flattened
+            self.graph_Vmax * self.graph_Vmax +  # A_pad flattened
+            self.graph_Vmax                       # node_mask
+        )
         
         assert self.readout in ("mean", "sum"), f"readout must be 'mean' or 'sum', got {readout}"
         
@@ -276,6 +300,7 @@ class Encoder_GIN(nn.Module):
         - post_ln: 是否在输出后加 LayerNorm（默认 False，仅 use_post_block=True 时生效）
         - post_act: 输出后的激活函数（默认 "relu"，可设 "none" 禁用）
         - post_dropout: 输出后的 dropout（默认 0.0）
+        - n_qubits: 量子比特数（用于解包 flat state vector，如未指定则从 actions 推断）
         """
         cfg = dict(cfg or {})
         
@@ -283,6 +308,10 @@ class Encoder_GIN(nn.Module):
         mlp_hid = cfg.get("mlp_hid", None)
         if mlp_hid is not None:
             mlp_hid = int(mlp_hid)
+        
+        n_qubits = cfg.get("n_qubits", None)
+        if n_qubits is not None:
+            n_qubits = int(n_qubits)
         
         return cls(
             actions=actions,
@@ -302,6 +331,7 @@ class Encoder_GIN(nn.Module):
             post_ln=bool(cfg.get("post_ln", False)),
             post_act=str(cfg.get("post_act", "relu")),
             post_dropout=float(cfg.get("post_dropout", 0.0)),
+            n_qubits=n_qubits,
         )
     
     def _parse_input(self, x) -> tuple:
@@ -312,6 +342,7 @@ class Encoder_GIN(nn.Module):
         1. dict with "state" key -> 递归解析 state
         2. dict: {"x": X, "a": A, "mask": M}
         3. tuple/list: (X, A) 或 (X, A, M)
+        4. flat tensor/ndarray: [B, graph_state_dim] 或 [graph_state_dim]（来自 RepresentationWrapper）
         """
         # 兼容 obs=dict 且含 "state" key 的情况
         if isinstance(x, dict) and "state" in x:
@@ -355,12 +386,81 @@ class Encoder_GIN(nn.Module):
             else:
                 raise ValueError(f"Expected tuple of length 2 or 3, got {len(x)}")
         
-        # 既不是 dict 也不是 tuple/list
+        # ===== 新增：flat tensor/ndarray 格式（来自 RepresentationWrapper.graph）=====
+        # 检测是否是 flat vector
+        is_flat = False
+        if isinstance(x, np.ndarray):
+            is_flat = (x.ndim == 1) or (x.ndim == 2 and x.shape[-1] == self.graph_state_dim)
+        elif isinstance(x, torch.Tensor):
+            is_flat = (x.dim() == 1) or (x.dim() == 2 and x.shape[-1] == self.graph_state_dim)
+        
+        if is_flat:
+            return self._unpack_flat_state(x)
+        
+        # 既不是 dict 也不是 tuple/list 也不是 flat vector
         raise ValueError(
-            f"Encoder_GIN requires graph input (dict with 'x'/'a' or tuple (X, A)), "
-            f"but got {type(x).__name__}. "
+            f"Encoder_GIN requires graph input (dict with 'x'/'a', tuple (X, A), or flat state vector), "
+            f"but got {type(x).__name__} with shape {getattr(x, 'shape', 'unknown')}. "
             "If you are using gate_seq scheme, please switch to a graph-based representation scheme."
         )
+    
+    def _unpack_flat_state(self, state_vec) -> tuple:
+        """
+        将 flat state vector 解包为 (X, A, node_mask)。
+        与 RepresentationWrapper.unpack_graph_state() 对齐。
+        
+        Args:
+            state_vec: shape = [B, graph_state_dim] 或 [graph_state_dim]
+        
+        Returns:
+            X:         节点特征矩阵, shape = [B, Vmax, F] 或 [Vmax, F]
+            A:         邻接矩阵, shape = [B, Vmax, Vmax] 或 [Vmax, Vmax]
+            node_mask: 有效节点 mask, shape = [B, Vmax] 或 [Vmax]
+        """
+        Vmax = self.graph_Vmax
+        F = self.graph_F
+        
+        # 转换为 numpy 方便切片
+        is_tensor = isinstance(state_vec, torch.Tensor)
+        if is_tensor:
+            was_tensor = True
+            device = state_vec.device
+            dtype = state_vec.dtype
+            state_vec = state_vec.cpu().numpy()
+        else:
+            was_tensor = False
+        
+        # 处理 batch 维度
+        if state_vec.ndim == 1:
+            state_vec = state_vec[np.newaxis, :]  # [1, D]
+            squeeze_batch = True
+        else:
+            squeeze_batch = False
+        
+        B = state_vec.shape[0]
+        
+        # 计算切分点
+        x_size = Vmax * F
+        a_size = Vmax * Vmax
+        
+        # 切片并 reshape
+        X = state_vec[:, :x_size].reshape(B, Vmax, F)
+        A = state_vec[:, x_size:x_size + a_size].reshape(B, Vmax, Vmax)
+        node_mask = state_vec[:, x_size + a_size:]
+        
+        # 还原 batch 维度
+        if squeeze_batch:
+            X = X[0]          # [Vmax, F]
+            A = A[0]          # [Vmax, Vmax]
+            node_mask = node_mask[0]  # [Vmax]
+        
+        # 还原 tensor
+        if was_tensor:
+            X = torch.from_numpy(X).to(device=device, dtype=dtype)
+            A = torch.from_numpy(A).to(device=device, dtype=dtype)
+            node_mask = torch.from_numpy(node_mask).to(device=device, dtype=dtype)
+        
+        return X, A, node_mask
     
     def _prepare_tensors(self, X, A, mask, device):
         """
