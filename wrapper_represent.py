@@ -285,7 +285,11 @@ class RepresentationWrapper(gym.Wrapper):
                     raise ValueError(
                         f"CNOT 门（action_id={aid}）target={q} 超出范围 [0, {self.n_qubits-1}]"
                     )
-                
+                if c == q:
+                    raise ValueError(
+                        f"CNOT 门（action_id={aid}）control={c} 和 target={q} 相同。"
+                    )
+                    
                 grid[0, t] = c  # cnot_control
                 grid[1, t] = q  # cnot_target
                 # grid[2,t] 和 grid[3,t] 保持 padding 默认值

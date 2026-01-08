@@ -4,7 +4,11 @@ import io
 import json
 from datetime import datetime
 from contextlib import redirect_stdout, redirect_stderr
-sys.path.insert(0, r"E:\Projects\BenchMark_state_scheme\tianshou")
+
+# 动态获取项目根目录，兼容Windows和Linux
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+TIANSHOU_PATH = os.path.join(PROJECT_ROOT, "tianshou")
+sys.path.insert(0, TIANSHOU_PATH)
 
 # import tianshou
 # print("tianshou from:", tianshou.__file__)
@@ -37,6 +41,79 @@ from trace_recorder import infer_step, rollout_trace
 from typing import Dict, List, Tuple, Any
 
 DEFAULT_BINS_ORDER = ["easy", "medium", "hard", "very_hard", "extreme"]
+
+# ============================================================================
+# Scheme-Encoder 兼容性验证
+# ============================================================================
+
+# 定义 scheme（state representation）与 encoder 的兼容关系
+SCHEME_ENCODER_COMPAT = {
+    "gate_seq": ["mlp", "rnn"],          # 序列 token ids -> MLP 或 RNN
+    "2d_grid": ["cnn"],                   # 2D grid -> CNN
+    "3d_tensor": ["cnn"],                 # 3D tensor -> CNN
+    "graph": ["gin"],                     # 图结构 -> GIN
+}
+
+def validate_scheme_encoder(scheme: str, encoder_type: str) -> None:
+    """
+    验证 scheme 和 encoder 是否兼容。
+    
+    Args:
+        scheme: state representation 类型 ("gate_seq", "2d_grid", "3d_tensor", "graph")
+        encoder_type: encoder 类型 ("mlp", "rnn", "cnn", "gin")
+    
+    Raises:
+        ValueError: 如果 scheme 和 encoder 不兼容
+    """
+    encoder_type = (encoder_type or "mlp").lower()
+    scheme = (scheme or "gate_seq").lower()
+    
+    valid_encoders = SCHEME_ENCODER_COMPAT.get(scheme, [])
+    if not valid_encoders:
+        raise ValueError(
+            f"Unknown scheme: '{scheme}'. "
+            f"Supported schemes: {list(SCHEME_ENCODER_COMPAT.keys())}"
+        )
+    
+    if encoder_type not in valid_encoders:
+        raise ValueError(
+            f"scheme='{scheme}' is not compatible with encoder='{encoder_type}'. "
+            f"Supported encoders for '{scheme}': {valid_encoders}"
+        )
+
+
+def init_lazy_encoder(encoder: nn.Module, dummy_env, encoder_type: str, device: str) -> int:
+    """
+    对于使用 LazyModule 的 encoder（GIN, CNN），用 dummy 数据初始化。
+    
+    Args:
+        encoder: 已构建的 encoder 模块
+        dummy_env: 用于获取 dummy observation 的 env
+        encoder_type: encoder 类型
+        device: 目标设备
+    
+    Returns:
+        encoder_params: 初始化后的参数量
+    """
+    encoder_type = (encoder_type or "mlp").lower()
+    
+    if encoder_type in ("gin", "cnn"):
+        # 获取一个真实的 observation 用于初始化
+        obs, _ = dummy_env.reset()
+        state = obs.get("state") if isinstance(obs, dict) else obs
+        
+        # 转换为 tensor 并 forward 一次以初始化 LazyModule
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state)
+        if state.dim() == 1 or (state.dim() == 2 and encoder_type == "cnn"):
+            state = state.unsqueeze(0)  # 添加 batch 维度
+        state = state.to(device).float()
+        
+        with torch.no_grad():
+            encoder(state)
+    
+    # 返回初始化后的参数量
+    return encoder.num_params
 
 
 def _try_get_optim_state(algorithm):
@@ -108,12 +185,32 @@ def _write_train_trace_from_buffer(buf, trace_data, out_path):
     用 buffer 里的 (obs, act, rew, done, info) 和预先收集的 trace_data 写 trace 文件。
     trace_data: (z, h, logits, mask, value) numpy 数组，来自 _merge_trace_cache。
     如果 trace_data 为 None，则跳过 z/h/logits/mask/value 的写入（仅写 buffer 基础信息）。
+    
+    注意：VectorReplayBuffer 使用分段存储（每个环境一个子 buffer），
+    必须用 sample_indices(0) 获取正确索引，而不是 np.arange(size)。
+    
+    重要：当 n_train_env > 1 时，trace_cache 的收集顺序（交错）与 buffer 存储顺序（分组）
+    不一致。目前仅支持 n_train_env=1 的正确 trace 记录。
     """
     size = len(buf)
     if size == 0:
         return {"episodes": 0, "steps": 0, "path": out_path}
 
-    batch_all = buf[np.arange(size)]
+    # 修复：使用 sample_indices(0) 获取所有有效索引，而不是 np.arange(size)
+    # 对于 VectorReplayBuffer，np.arange(size) 只会读取第一个子 buffer 的数据
+    indices = buf.sample_indices(0)
+    batch_all = buf[indices]
+    
+    # 检查是否是多环境（buffer_num > 1）
+    buffer_num = getattr(buf, 'buffer_num', 1)
+    if buffer_num > 1 and trace_data is not None:
+        import warnings
+        warnings.warn(
+            f"n_train_env={buffer_num} > 1: trace_cache 顺序与 buffer 顺序不一致，"
+            "trace 文件中的 z/h/logits/mask/value 可能与 action/reward 不匹配。"
+            "建议使用 n_train_env=1 以确保 trace 数据正确性。",
+            UserWarning
+        )
     acts = batch_all.act
     rews = batch_all.rew
     dones = batch_all.done
@@ -286,14 +383,40 @@ def make_env(train_tasks, test_tasks, mode, scheme,
     return env
 
 class SharedMLP(nn.Module):
-    def __init__(self, in_dim, out_dim=256, act="silu", use_ln=True):
+    """
+    Shared MLP layer between encoder and heads.
+    
+    Args:
+        in_dim: 输入维度（encoder.out_dim）
+        out_dim: 输出维度（默认 256）
+        act: 激活函数 "silu" / "relu" / "gelu" / "none"（默认 "silu"）
+        use_ln: 是否使用 LayerNorm（默认 True）
+        dropout: Dropout 比率（默认 0.0，不使用）
+    
+    顺序：proj -> act -> ln -> dropout
+    """
+    def __init__(self, in_dim, out_dim=256, act="silu", use_ln=True, dropout=0.0):
         super().__init__()
         self.proj = nn.Identity() if in_dim == out_dim else nn.Linear(in_dim, out_dim)
-        self.act = nn.SiLU() if act == "silu" else nn.ReLU()
+        
+        # 激活函数（支持 none）
+        act_lower = (act or "none").lower()
+        if act_lower == "silu" or act_lower == "swish":
+            self.act = nn.SiLU()
+        elif act_lower == "relu":
+            self.act = nn.ReLU()
+        elif act_lower == "gelu":
+            self.act = nn.GELU()
+        elif act_lower == "none" or act_lower == "identity":
+            self.act = nn.Identity()
+        else:
+            self.act = nn.SiLU()  # 默认 silu
+        
         self.ln = nn.LayerNorm(out_dim) if use_ln else nn.Identity()
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, z):
-        return self.ln(self.act(self.proj(z)))
+        return self.dropout(self.ln(self.act(self.proj(z))))
 
 class ActorCritic(nn.Module):
     def __init__(self, encoder: nn.Module, shared: nn.Module, feat_dim: int, act_dim: int):
@@ -531,13 +654,30 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     # -----------------------
     # 3) build network（只依赖 net_cfg）
     # -----------------------
+    # 获取 encoder 类型（默认 mlp）
+    encoder_type = (
+        net_cfg.get("encoder") or
+        net_cfg.get("enc_name") or
+        net_cfg.get("enc_type") or
+        "mlp"
+    ).lower()
+    
+    # 验证 scheme 和 encoder 的兼容性
+    validate_scheme_encoder(scheme, encoder_type)
+    
+    # 构建 encoder
     encoder = build_encoder(actions=actions, max_gates=max_gates, net_cfg=net_cfg).to(device)
+    
+    # 对于使用 LazyModule 的 encoder（GIN, CNN），用 dummy 数据初始化
+    encoder_params = init_lazy_encoder(encoder, dummy, encoder_type, device)
+    
     enc_out = int(getattr(encoder, "out_dim", net_cfg.get("out_dim", 256)))
     use_ln = bool(net_cfg.get("use_ln", True))
     shared_act = str(net_cfg.get("shared_act", "silu"))
     shared_out = int(net_cfg.get("shared_out_dim", enc_out))
+    shared_dropout = float(net_cfg.get("shared_dropout", 0.0))
 
-    shared = SharedMLP(in_dim=enc_out, out_dim=shared_out, act=shared_act, use_ln=use_ln).to(device)
+    shared = SharedMLP(in_dim=enc_out, out_dim=shared_out, act=shared_act, use_ln=use_ln, dropout=shared_dropout).to(device)
 
     feat_dim = shared_out
     ac = ActorCritic(encoder, shared, feat_dim=feat_dim, act_dim=act_dim).to(device)
@@ -656,6 +796,8 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
         "run_id": run_id,
         "stage": stage_name, ## suite name
         "scheme": scheme,
+        "encoder_type": encoder_type,          # 新增：encoder 类型
+        "encoder_params": encoder_params,      # 新增：encoder 参数量
         "task_id": task.get("task_id", None),
         "difficulty_bin": task.get("difficulty_bin", None),
         "seed": int(seed),
@@ -1151,6 +1293,9 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
 
     summary = {
         "run_id": run_id,
+        "scheme": scheme,                      # 新增：state representation 类型
+        "encoder_type": encoder_type,          # 新增：encoder 类型
+        "encoder_params": encoder_params,      # 新增：encoder 参数量
         "task_id": task.get("task_id", None),
         "difficulty_bin": task.get("difficulty_bin", None),
         "seed": int(seed),
@@ -1702,6 +1847,7 @@ def run_suite_all_tasks(
     }
 
 
+
 def main(
 scheme: str, 
 net_cfg_list: list, 
@@ -1718,11 +1864,15 @@ sampled_json_path: str = "task_suites/Final_sampled_bin10.json",
     
     # ----------------
     # 1) network configs (baseline grid)
-    #   说明：net_cfg 通过 Encoder_MLP.from_cfg + SharedMLP 共同生效
+    #   说明：net_cfg 通过 build_encoder + SharedMLP 共同生效
+    #   注意：net_cfg["encoder"] 必须与 scheme 兼容（见 SCHEME_ENCODER_COMPAT）
     # ----------------
     if net_cfg_list is None:
+        # 根据 scheme 选择默认的 encoder 配置
+        default_encoder = SCHEME_ENCODER_COMPAT.get(scheme, ["mlp"])[0]
         net_cfg_list_final = [
-            {"name": "E055k_h64_d2",
+            {"name": f"{default_encoder.upper()}_default",
+             "encoder": default_encoder,
              "hid": 64, "depth": 2,
              "act": "silu", "use_ln": True,
              "dropout": 0.0, "input_dropout": 0.0,
@@ -1756,7 +1906,7 @@ sampled_json_path: str = "task_suites/Final_sampled_bin10.json",
     # ----------------
     if train_cfg is None:
         train_cfg_final = {
-            "n_train_env": 8, 
+            "n_train_env": 1,  # 使用单环境避免 trace 数据对齐问题
             "n_test_env": 8, 
             "n_eval_env": 8, 
             "n_eval_episodes": 100, 
@@ -1821,6 +1971,64 @@ sampled_json_path: str = "task_suites/Final_sampled_bin10.json",
                 tasks_set=task_list,
             )
     
+
+def main_multi_schemes(
+    experiments: List[Tuple[str, List[dict]]],
+    algo_cfg: dict,
+    train_cfg: dict,
+    seeds: List[int],
+    in_dir: str = "task_suites",
+    suite_name: str = "Final",
+    sampled_json_path: str = "task_suites/Final_sampled_bin10.json",
+):
+    """
+    批量运行多种 scheme + encoder 组合的实验。
+    
+    Args:
+        experiments: List of (scheme, net_cfg_list) tuples
+            例如:
+            [
+                ("gate_seq", [{"name": "MLP_100k", "encoder": "mlp", ...}]),
+                ("gate_seq", [{"name": "RNN_100k", "encoder": "rnn", ...}]),
+                ("2d_grid",  [{"name": "CNN_100k", "encoder": "cnn", ...}]),
+                ("graph",    [{"name": "GIN_100k", "encoder": "gin", ...}]),
+            ]
+        algo_cfg: PPO 算法配置
+        train_cfg: 训练配置
+        seeds: 随机种子列表
+        in_dir: 任务集目录
+        suite_name: 任务集名称
+        sampled_json_path: 抽样任务 JSON 路径
+    
+    Examples:
+        >>> experiments = [
+        ...     ("gate_seq", [{"name": "MLP_100k", "encoder": "mlp", "hid": 48, ...}]),
+        ...     ("gate_seq", [{"name": "RNN_100k", "encoder": "rnn", "hidden_size": 126, ...}]),
+        ...     ("2d_grid",  [{"name": "CNN_100k", "encoder": "cnn", "hid": 94, ...}]),
+        ...     ("graph",    [{"name": "GIN_100k", "encoder": "gin", "hid": 110, ...}]),
+        ... ]
+        >>> main_multi_schemes(experiments, algo_cfg, train_cfg, seeds=[0, 1, 2])
+    """
+    print(f"[multi_schemes] Total experiments: {len(experiments)}")
+    
+    for exp_idx, (scheme, net_cfg_list) in enumerate(experiments):
+        print(f"\n{'='*60}")
+        print(f"[Experiment {exp_idx + 1}/{len(experiments)}] scheme={scheme}")
+        print(f"  encoders: {[cfg.get('name', cfg.get('encoder', 'unnamed')) for cfg in net_cfg_list]}")
+        print("=" * 60)
+        
+        main(
+            scheme=scheme,
+            net_cfg_list=net_cfg_list,
+            algo_cfg=algo_cfg,
+            train_cfg=train_cfg,
+            seeds=seeds,
+            in_dir=in_dir,
+            suite_name=suite_name,
+            sampled_json_path=sampled_json_path,
+        )
+    
+    print(f"\n[multi_schemes] All {len(experiments)} experiments completed.")
 
 
 if __name__ == "__main__":
@@ -1921,29 +2129,15 @@ if __name__ == "__main__":
     #     in_dir="task_suites", 
     #     suite_name="Final", 
     #     sampled_json_path="task_suites/Final_sampled_bin10.json"
-        
     #     )
 
-    ## 测试任务测试数据记录功能
-    main(
-    scheme = "gate_seq", 
-    net_cfg_list = [
-    # ====== Tiny / Smoke ======
-    {"name": "E055k_h64_d2",
-     "hid": 64, "depth": 2,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
 
-    # ====== Small ======
-    {"name": "E118k_h128_d2",
-     "hid": 128, "depth": 2,
-     "act": "silu", "use_ln": True,
-     "dropout": 0.0, "input_dropout": 0.0,
-     "out_dim": 256, "shared_out_dim": 256, "shared_act": "silu"},
-
-
-     ],
+    # ============================================================================
+    # 全面的 State Scheme Benchmark 实验
+    # 涵盖所有 scheme + encoder 组合，每种 2 个配置（小/中规模）
+    # ============================================================================
+    
+    # 共享的算法配置
     algo_cfg = {
         "lr": 3e-4,
         "gamma": 0.99,
@@ -1951,20 +2145,22 @@ if __name__ == "__main__":
         "max_grad_norm": 0.5,
         "eps_clip": 0.2,
         "vf_coef": 0.5,
-        "ent_coef": 0.02,  # 比你原来的 0.01 更鼓励探索（Dev 阶段更有用）
+        "ent_coef": 0.02,
         "advantage_normalization": True,
         "value_clip": False,
         "return_scaling": False,
-    }, 
-    train_cfg= {
-        # ===== 日志目录：本次测试专用 =====
-        "log_dir": "logs_trace_inline",
-        "n_train_env": 2, 
+    }
+    
+    # 共享的训练配置
+    train_cfg = {
+        # ===== 日志目录 =====
+        "log_dir": "logs_benchmark_schemes",
+        "n_train_env": 1,  # 使用单环境避免 trace 数据对齐问题
         # 先别太大：调 bug / 看趋势用 30k~50k 更合适
         "total_budget_steps": 10240, 
         # 每 5k 做一次 greedy_eval（steps_to_solve 粒度也就是 5k）
         "eval_every_steps": 512,
-        "eval_episodes": 2, # 评估 episode 数
+        "eval_episodes": 2,  # 评估 episode 数
         # PPO rollout / update 强度：先保守，稳定优先
         "collect_steps": 2048,
         "update_reps": 8,
@@ -1974,14 +2170,96 @@ if __name__ == "__main__":
         # 需要的话你也能显式写死阈值（否则从 env 里读）
         "fidelity_threshold": 0.95,
         # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
-        "max_gates": 20,  ##最大14 1.4* 14 = 20
+        "max_gates": 20,  # 最大14 * 1.4 = 20
         # 评估成功后直接提前停掉，节省预算
         "early_stop_on_success": True,
         # 连续成功多少次才提前停（>=1）
         "early_stop_consecutive_success": 3,
-    }, 
-        seeds=[0, 1], 
-        in_dir="task_suites", 
-        suite_name="Final", 
-        sampled_json_path="task_suites/Final_sampled_bin5.json"
-        )
+    }
+    
+    # 共享的 SharedMLP 配置
+    shared_cfg = {"shared_out_dim": 256, "shared_act": "silu"}
+    
+    # ============================================================================
+    # 实验配置：(scheme, net_cfg_list) 列表
+    # ============================================================================
+    experiments = [
+        # ===== 1. gate_seq + MLP =====
+        # ("gate_seq", [
+        #     {"name": "MLP_small_h64_d2", "encoder": "mlp",
+        #      "hid": 64, "depth": 2, "out_dim": 128,
+        #      "act": "silu", "use_ln": True, "dropout": 0.0,
+        #      **shared_cfg},
+        #     {"name": "MLP_medium_h128_d2", "encoder": "mlp",
+        #      "hid": 128, "depth": 2, "out_dim": 256,
+        #      "act": "silu", "use_ln": True, "dropout": 0.0,
+        #      **shared_cfg},
+        # ]),
+        
+        # # ===== 2. gate_seq + RNN =====
+        # ("gate_seq", [
+        #     {"name": "RNN_small_hs64", "encoder": "rnn",
+        #      "embed_dim": 32, "hidden_size": 64, "num_layers": 1,
+        #      "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+        #      "out_dim": 64,
+        #      **shared_cfg},
+        #     {"name": "RNN_medium_hs128", "encoder": "rnn",
+        #      "embed_dim": 64, "hidden_size": 128, "num_layers": 1,
+        #      "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+        #      "out_dim": 128,
+        #      **shared_cfg},
+        # ]),
+        
+        # # ===== 3. 2d_grid + CNN =====
+        # ("2d_grid", [
+        #     {"name": "CNN_2d_small_h48_d3", "encoder": "cnn",
+        #      "hid": 48, "depth": 3, "kernel_size": 3,
+        #      "out_dim": 96, "use_proj": True,
+        #      "act": "relu", "dropout": 0.0, "mode": "grid",
+        #      **shared_cfg},
+        #     {"name": "CNN_2d_medium_h96_d3", "encoder": "cnn",
+        #      "hid": 96, "depth": 3, "kernel_size": 3,
+        #      "out_dim": 192, "use_proj": True,
+        #      "act": "relu", "dropout": 0.0, "mode": "grid",
+        #      **shared_cfg},
+        # ]),
+        
+        # # ===== 4. 3d_tensor + CNN =====
+        # ("3d_tensor", [
+        #     {"name": "CNN_3d_small_h48_d3", "encoder": "cnn",
+        #      "hid": 48, "depth": 3, "kernel_size": 3,
+        #      "out_dim": 96, "use_proj": True,
+        #      "act": "relu", "dropout": 0.0, "mode": "tensor",
+        #      **shared_cfg},
+        #     {"name": "CNN_3d_medium_h96_d3", "encoder": "cnn",
+        #      "hid": 96, "depth": 3, "kernel_size": 3,
+        #      "out_dim": 192, "use_proj": True,
+        #      "act": "relu", "dropout": 0.0, "mode": "tensor",
+        #      **shared_cfg},
+        # ]),
+        
+        # ===== 5. graph + GIN =====
+        ("graph", [
+            {"name": "GIN_small_h64_d3", "encoder": "gin",
+             "hid": 64, "depth": 3, "mlp_depth": 2,
+             "out_dim": 128, "readout": "mean",
+             "norm": "ln", "dropout": 0.0,
+             **shared_cfg},
+            {"name": "GIN_medium_h128_d3", "encoder": "gin",
+             "hid": 128, "depth": 3, "mlp_depth": 2,
+             "out_dim": 256, "readout": "mean",
+             "norm": "ln", "dropout": 0.0,
+             **shared_cfg},
+        ]),
+    ]
+    
+    # 运行批量实验
+    main_multi_schemes(
+        experiments=experiments,
+        algo_cfg=algo_cfg,
+        train_cfg=train_cfg,
+        seeds=[0, 1],
+        in_dir="task_suites",
+        suite_name="Final",
+        sampled_json_path="task_suites/Final_sampled_bin5.json",
+    )
