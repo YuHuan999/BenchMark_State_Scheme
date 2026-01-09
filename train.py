@@ -215,6 +215,9 @@ def _write_train_trace_from_buffer(buf, trace_data, out_path):
     rews = batch_all.rew
     dones = batch_all.done
     infos = batch_all.info
+    # 修复：直接从 batch_all 读取 terminated 和 truncated，而不是从 info 中读取
+    terms = batch_all.terminated
+    truncs = batch_all.truncated
 
     # 解包 trace_data
     z_all, h_all, logits_all, mask_all, value_all = trace_data if trace_data else (None, None, None, None, None)
@@ -269,8 +272,9 @@ def _write_train_trace_from_buffer(buf, trace_data, out_path):
         a = int(acts[i])
         done_flag = bool(dones[i])
         fid_after = float(_get_info("fidelity", 0.0))
-        terminated = bool(_get_info("terminated", done_flag))
-        truncated = bool(_get_info("truncated", False))
+        # 修复：直接使用 batch_all 中的 terminated 和 truncated
+        terminated = bool(terms[i])
+        truncated = bool(truncs[i])
 
         act_list.append(a)
         fid_after_list.append(fid_after)
@@ -2129,7 +2133,7 @@ if __name__ == "__main__":
     #     # 需要的话你也能显式写死阈值（否则从 env 里读）
     #     "fidelity_threshold": 0.95,
     #     # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
-    #     "max_gates": 20,  ##最大14 1.4* 14 = 20
+    #     "max_gates": 25,  ##最大14 1.5 * 14 = 20
     #     # 评估成功后直接提前停掉，节省预算
     #     "early_stop_on_success": True,
     #     # 连续成功多少次才提前停（>=1）
@@ -2180,7 +2184,7 @@ if __name__ == "__main__":
         # 需要的话你也能显式写死阈值（否则从 env 里读）
         "fidelity_threshold": 0.95,
         # 可选：覆盖 env 默认 max_gates（不写则用 env 默认 78）
-        "max_gates": 20,  # 最大14 * 1.4 = 20
+        "max_gates": 25,  # 最大14 * 1.4 = 20
         # 评估成功后直接提前停掉，节省预算
         "early_stop_on_success": True,
         # 连续成功多少次才提前停（>=1）
@@ -2264,15 +2268,17 @@ if __name__ == "__main__":
     ]
     
     # 运行批量实验 (测试用小规模配置)
-    # main_multi_schemes(
-    #     experiments=experiments,
-    #     algo_cfg=algo_cfg,
-    #     train_cfg=train_cfg,
-    #     seeds=[0, 1],
-    #     in_dir="task_suites",
-    #     suite_name="Final",
-    #     sampled_json_path="task_suites/Final_sampled_bin5.json",
-    # )
+    print("Running test experiments...")
+    main_multi_schemes(
+        experiments=experiments,
+        algo_cfg=algo_cfg,
+        train_cfg=train_cfg,
+        seeds=[0, 1],
+        in_dir="task_suites",
+        suite_name="Final",
+        sampled_json_path="task_suites/Final_sampled_bin5.json",
+    )
+    print(" test experiments finished...")
 
     # ============================================================================
     # 正式实验：gate_seq + MLP（8 个参数量等级）
@@ -2304,7 +2310,7 @@ if __name__ == "__main__":
         "batch_size": 256,
         "buffer_size": 20000,
         "fidelity_threshold": 0.95,
-        "max_gates": 20,
+        "max_gates": 25,  #当前任务最大门数：14，最大预算steps：1.5 * 14 = 21，向上取整25
         "early_stop_on_success": True,
         "early_stop_consecutive_success": 3,
     }
@@ -2358,13 +2364,13 @@ if __name__ == "__main__":
         ]),
     ]
     
-    # 运行 MLP 实验
-    main_multi_schemes(
-        experiments=mlp_experiments,
-        algo_cfg=mlp_algo_cfg,
-        train_cfg=mlp_train_cfg,
-        seeds=[0, 1, 2, 3, 4],
-        in_dir="task_suites",
-        suite_name="Final",
-        sampled_json_path="task_suites/Final_sampled_bin10.json",
-    )
+    # # 运行 MLP 实验
+    # main_multi_schemes(
+    #     experiments=mlp_experiments,
+    #     algo_cfg=mlp_algo_cfg,
+    #     train_cfg=mlp_train_cfg,
+    #     seeds=[0, 1, 2, 3, 4],
+    #     in_dir="task_suites",
+    #     suite_name="Final",
+    #     sampled_json_path="task_suites/Final_sampled_bin10.json",
+    # )
