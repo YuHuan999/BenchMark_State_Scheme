@@ -236,8 +236,18 @@ def _write_train_trace_from_buffer(buf, trace_data, out_path):
 
     for i in range(size):
         # env_id / episode_id
+        # 注意：info_i 可能是 dict 或 Batch 类型，两者都支持 .get() 方法
         info_i = infos[i]
-        env_id = int(info_i.get("env_id", 0)) if isinstance(info_i, dict) else 0
+        
+        # 辅助函数：从 info_i 获取值（兼容 dict 和 Batch）
+        def _get_info(key, default=None):
+            if hasattr(info_i, 'get'):
+                return info_i.get(key, default)
+            elif hasattr(info_i, key):
+                return getattr(info_i, key, default)
+            return default
+        
+        env_id = int(_get_info("env_id", 0))
         env_ids.append(env_id)
         ep_ids.append(ep_counter[env_id])
 
@@ -258,9 +268,9 @@ def _write_train_trace_from_buffer(buf, trace_data, out_path):
 
         a = int(acts[i])
         done_flag = bool(dones[i])
-        fid_after = float(info_i.get("fidelity", 0.0)) if isinstance(info_i, dict) else 0.0
-        terminated = bool(info_i.get("terminated", done_flag)) if isinstance(info_i, dict) else done_flag
-        truncated = bool(info_i.get("truncated", False)) if isinstance(info_i, dict) else False
+        fid_after = float(_get_info("fidelity", 0.0))
+        terminated = bool(_get_info("terminated", done_flag))
+        truncated = bool(_get_info("truncated", False))
 
         act_list.append(a)
         fid_after_list.append(fid_after)
@@ -2185,58 +2195,58 @@ if __name__ == "__main__":
     # ============================================================================
     experiments = [
         # ===== 1. gate_seq + MLP =====
-        # ("gate_seq", [
-        #     {"name": "MLP_small_h64_d2", "encoder": "mlp",
-        #      "hid": 64, "depth": 2, "out_dim": 128,
-        #      "act": "silu", "use_ln": True, "dropout": 0.0,
-        #      **shared_cfg},
-        #     {"name": "MLP_medium_h128_d2", "encoder": "mlp",
-        #      "hid": 128, "depth": 2, "out_dim": 256,
-        #      "act": "silu", "use_ln": True, "dropout": 0.0,
-        #      **shared_cfg},
-        # ]),
+        ("gate_seq", [
+            {"name": "MLP_small_h64_d2", "encoder": "mlp",
+             "hid": 64, "depth": 2, "out_dim": 128,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **shared_cfg},
+            {"name": "MLP_medium_h128_d2", "encoder": "mlp",
+             "hid": 128, "depth": 2, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **shared_cfg},
+        ]),
         
-        # # ===== 2. gate_seq + RNN =====
-        # ("gate_seq", [
-        #     {"name": "RNN_small_hs64", "encoder": "rnn",
-        #      "embed_dim": 32, "hidden_size": 64, "num_layers": 1,
-        #      "rnn_type": "lstm", "bidirectional": False, "pool": "last",
-        #      "out_dim": 64,
-        #      **shared_cfg},
-        #     {"name": "RNN_medium_hs128", "encoder": "rnn",
-        #      "embed_dim": 64, "hidden_size": 128, "num_layers": 1,
-        #      "rnn_type": "lstm", "bidirectional": False, "pool": "last",
-        #      "out_dim": 128,
-        #      **shared_cfg},
-        # ]),
+        # ===== 2. gate_seq + RNN =====
+        ("gate_seq", [
+            {"name": "RNN_small_hs64", "encoder": "rnn",
+             "embed_dim": 32, "hidden_size": 64, "num_layers": 1,
+             "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+             "out_dim": 64,
+             **shared_cfg},
+            {"name": "RNN_medium_hs128", "encoder": "rnn",
+             "embed_dim": 64, "hidden_size": 128, "num_layers": 1,
+             "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+             "out_dim": 128,
+             **shared_cfg},
+        ]),
         
-        # # ===== 3. 2d_grid + CNN =====
-        # ("2d_grid", [
-        #     {"name": "CNN_2d_small_h48_d3", "encoder": "cnn",
-        #      "hid": 48, "depth": 3, "kernel_size": 3,
-        #      "out_dim": 96, "use_proj": True,
-        #      "act": "relu", "dropout": 0.0, "mode": "grid",
-        #      **shared_cfg},
-        #     {"name": "CNN_2d_medium_h96_d3", "encoder": "cnn",
-        #      "hid": 96, "depth": 3, "kernel_size": 3,
-        #      "out_dim": 192, "use_proj": True,
-        #      "act": "relu", "dropout": 0.0, "mode": "grid",
-        #      **shared_cfg},
-        # ]),
+        # ===== 3. 2d_grid + CNN =====
+        ("2d_grid", [
+            {"name": "CNN_2d_small_h48_d3", "encoder": "cnn",
+             "hid": 48, "depth": 3, "kernel_size": 3,
+             "out_dim": 96, "use_proj": True,
+             "act": "relu", "dropout": 0.0, "mode": "grid",
+             **shared_cfg},
+            {"name": "CNN_2d_medium_h96_d3", "encoder": "cnn",
+             "hid": 96, "depth": 3, "kernel_size": 3,
+             "out_dim": 192, "use_proj": True,
+             "act": "relu", "dropout": 0.0, "mode": "grid",
+             **shared_cfg},
+        ]),
         
-        # # ===== 4. 3d_tensor + CNN =====
-        # ("3d_tensor", [
-        #     {"name": "CNN_3d_small_h48_d3", "encoder": "cnn",
-        #      "hid": 48, "depth": 3, "kernel_size": 3,
-        #      "out_dim": 96, "use_proj": True,
-        #      "act": "relu", "dropout": 0.0, "mode": "tensor",
-        #      **shared_cfg},
-        #     {"name": "CNN_3d_medium_h96_d3", "encoder": "cnn",
-        #      "hid": 96, "depth": 3, "kernel_size": 3,
-        #      "out_dim": 192, "use_proj": True,
-        #      "act": "relu", "dropout": 0.0, "mode": "tensor",
-        #      **shared_cfg},
-        # ]),
+        # ===== 4. 3d_tensor + CNN =====
+        ("3d_tensor", [
+            {"name": "CNN_3d_small_h48_d3", "encoder": "cnn",
+             "hid": 48, "depth": 3, "kernel_size": 3,
+             "out_dim": 96, "use_proj": True,
+             "act": "relu", "dropout": 0.0, "mode": "tensor",
+             **shared_cfg},
+            {"name": "CNN_3d_medium_h96_d3", "encoder": "cnn",
+             "hid": 96, "depth": 3, "kernel_size": 3,
+             "out_dim": 192, "use_proj": True,
+             "act": "relu", "dropout": 0.0, "mode": "tensor",
+             **shared_cfg},
+        ]),
         
         # ===== 5. graph + GIN =====
         ("graph", [
@@ -2253,13 +2263,108 @@ if __name__ == "__main__":
         ]),
     ]
     
-    # 运行批量实验
+    # 运行批量实验 (测试用小规模配置)
+    # main_multi_schemes(
+    #     experiments=experiments,
+    #     algo_cfg=algo_cfg,
+    #     train_cfg=train_cfg,
+    #     seeds=[0, 1],
+    #     in_dir="task_suites",
+    #     suite_name="Final",
+    #     sampled_json_path="task_suites/Final_sampled_bin5.json",
+    # )
+
+    # ============================================================================
+    # 正式实验：gate_seq + MLP（8 个参数量等级）
+    # ============================================================================
+    
+    # PPO 算法配置
+    mlp_algo_cfg = {
+        "lr": 3e-4,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "max_grad_norm": 0.5,
+        "eps_clip": 0.2,
+        "vf_coef": 0.5,
+        "ent_coef": 0.02,
+        "advantage_normalization": True,
+        "value_clip": False,
+        "return_scaling": False,
+    }
+    
+    # 训练配置
+    mlp_train_cfg = {
+        "log_dir": "logs_benchmark_MLP",
+        "n_train_env": 1,
+        "total_budget_steps": 500000,
+        "eval_every_steps": 5000,
+        "eval_episodes": 5,
+        "collect_steps": 2048,
+        "update_reps": 8,
+        "batch_size": 256,
+        "buffer_size": 20000,
+        "fidelity_threshold": 0.95,
+        "max_gates": 20,
+        "early_stop_on_success": True,
+        "early_stop_consecutive_success": 3,
+    }
+    
+    # SharedMLP 配置
+    mlp_shared_cfg = {"shared_out_dim": 256, "shared_act": "silu"}
+    
+    # MLP 实验配置（8 个参数量等级）
+    mlp_experiments = [
+        ("gate_seq", [
+            # ~186K params (hid=64, depth=2)
+            {"name": "MLP_h64_d2", "encoder": "mlp",
+             "hid": 64, "depth": 2, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+            # ~380K params (hid=128, depth=2)
+            {"name": "MLP_h128_d2", "encoder": "mlp",
+             "hid": 128, "depth": 2, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+            # ~792K params (hid=256, depth=2)
+            {"name": "MLP_h256_d2", "encoder": "mlp",
+             "hid": 256, "depth": 2, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+            # ~858K params (hid=256, depth=3)
+            {"name": "MLP_h256_d3", "encoder": "mlp",
+             "hid": 256, "depth": 3, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+            # ~1237K params (hid=384, depth=2)
+            {"name": "MLP_h384_d2", "encoder": "mlp",
+             "hid": 384, "depth": 2, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+            # ~1385K params (hid=384, depth=3)
+            {"name": "MLP_h384_d3", "encoder": "mlp",
+             "hid": 384, "depth": 3, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+            # ~1714K params (hid=512, depth=2)
+            {"name": "MLP_h512_d2", "encoder": "mlp",
+             "hid": 512, "depth": 2, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+            # ~1978K params (hid=512, depth=3)
+            {"name": "MLP_h512_d3", "encoder": "mlp",
+             "hid": 512, "depth": 3, "out_dim": 256,
+             "act": "silu", "use_ln": True, "dropout": 0.0,
+             **mlp_shared_cfg},
+        ]),
+    ]
+    
+    # 运行 MLP 实验
     main_multi_schemes(
-        experiments=experiments,
-        algo_cfg=algo_cfg,
-        train_cfg=train_cfg,
-        seeds=[0, 1],
+        experiments=mlp_experiments,
+        algo_cfg=mlp_algo_cfg,
+        train_cfg=mlp_train_cfg,
+        seeds=[0, 1, 2, 3, 4],
         in_dir="task_suites",
         suite_name="Final",
-        sampled_json_path="task_suites/Final_sampled_bin5.json",
+        sampled_json_path="task_suites/Final_sampled_bin10.json",
     )
