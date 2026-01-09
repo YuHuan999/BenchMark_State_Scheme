@@ -70,6 +70,7 @@ class GINLayer(nn.Module):
         eps_learnable: bool = True,
         norm: str = "ln",
         dropout: float = 0.0,
+        act: str = "relu",  # 激活函数，支持 relu/silu/gelu 等
     ):
         super().__init__()
         
@@ -82,7 +83,7 @@ class GINLayer(nn.Module):
             self.register_buffer("eps", torch.zeros(1))
         
         # 构建 MLP
-        # 结构：Linear -> Norm -> ReLU (重复 mlp_depth-1 次) -> Linear
+        # 结构：Linear -> Norm -> Act (重复 mlp_depth-1 次) -> Linear
         layers = []
         dims = [in_dim] + [mlp_hid] * (mlp_depth - 1) + [out_dim]
         
@@ -91,7 +92,7 @@ class GINLayer(nn.Module):
             is_last = (i == len(dims) - 2)
             if not is_last:
                 layers.append(_make_norm(norm, dims[i + 1]))
-                layers.append(nn.ReLU())
+                layers.append(_make_activation(act))  # 使用配置的激活函数
                 if dropout > 0:
                     layers.append(nn.Dropout(p=dropout))
         
@@ -149,6 +150,7 @@ class Encoder_GIN(nn.Module):
         use_undirected: bool = True,
         add_self_loops: bool = True,
         norm: str = "ln",
+        act: str = "relu",  # GIN 内部 MLP 的激活函数
         dropout: float = 0.0,
         use_post_block: bool = True,
         post_ln: bool = False,
@@ -209,6 +211,7 @@ class Encoder_GIN(nn.Module):
                     eps_learnable=eps_learnable,
                     norm=norm,
                     dropout=dropout,
+                    act=act,  # 传递激活函数配置
                 )
             )
         
@@ -292,6 +295,7 @@ class Encoder_GIN(nn.Module):
         - use_undirected: 是否把 A 变成 A + A^T（默认 True）
         - add_self_loops: 是否给 A 加单位阵（默认 True）
         - norm: "ln" / "bn" / "none"（默认 "ln"）
+        - act: GIN 内部 MLP 激活函数（默认 "relu"，支持 "silu"/"gelu" 等）
         - dropout: 默认 0.0
         - use_post_block: 是否使用 out_proj + post（默认 True）
             - True: 使用 out_proj 投影到 out_dim，并应用 post 处理，out_dim = out_dim
@@ -326,6 +330,7 @@ class Encoder_GIN(nn.Module):
             use_undirected=bool(cfg.get("use_undirected", True)),
             add_self_loops=bool(cfg.get("add_self_loops", True)),
             norm=str(cfg.get("norm", "ln")),
+            act=str(cfg.get("act", "relu")),  # GIN 内部 MLP 激活函数
             dropout=float(cfg.get("dropout", 0.0)),
             use_post_block=bool(cfg.get("use_post_block", True)),
             post_ln=bool(cfg.get("post_ln", False)),

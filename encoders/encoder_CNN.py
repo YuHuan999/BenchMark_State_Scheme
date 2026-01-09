@@ -80,6 +80,9 @@ class Encoder_CNN(nn.Module):
         self.mode = mode.lower()
         self.use_proj = bool(use_proj)
         
+        # 保存激活函数实例，用于 forward 中的 first conv 激活
+        self.first_act = _make_activation(act)
+        
         # out_dim 取决于是否使用投影层
         if self.use_proj:
             self.out_dim = int(out_dim)
@@ -354,7 +357,7 @@ class Encoder_CNN(nn.Module):
         
         # Conv1d forward
         out = self.grid_first(feat)  # [B, hid, T]
-        out = F.relu(out)
+        out = self.first_act(out)  # 使用配置的激活函数
         out = self.grid_backbone(out)  # [B, hid, T]
         
         # Masked mean pooling：只在 valid steps 上做平均
@@ -448,7 +451,7 @@ class Encoder_CNN(nn.Module):
         
         # Conv2d forward
         out = self.tensor_first(x_perm)  # [B, hid, D, N]
-        out = F.relu(out)
+        out = self.first_act(out)  # 使用配置的激活函数
         out = self.tensor_backbone(out)  # [B, hid, D, N]
         
         # Masked pooling：
