@@ -797,10 +797,10 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
     # trace / ckpt 目录
     traces_train_dir = os.path.join(logger.run_dir, "traces", "train")
     traces_eval_dir = os.path.join(logger.run_dir, "traces", "eval")
-    ckpt_dir = os.path.join(logger.run_dir, "checkpoints")
+    # ckpt_dir = os.path.join(logger.run_dir, "checkpoints")  # 暂时禁用 checkpoint 功能
     os.makedirs(traces_train_dir, exist_ok=True)
     os.makedirs(traces_eval_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
+    # os.makedirs(ckpt_dir, exist_ok=True)  # 暂时禁用 checkpoint 功能
     chunks_index_path = os.path.join(logger.run_dir, "chunks.jsonl")
     if not os.path.exists(chunks_index_path):
         open(chunks_index_path, "a", encoding="utf-8").close()
@@ -1122,24 +1122,24 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
             last_margin_mean = margin_mean_eval
             last_k_eff_mean = k_eff_mean_eval
 
-            # 保存 checkpoint（模型/优化器/RNG）
-            ckpt_path = os.path.join(
-                ckpt_dir, f"ckpt_chunk_{chunk_idx:04d}_step_{trained:08d}.pt"
-            )
-            optim_state = _try_get_optim_state(algorithm)
-            ckpt = {
-                "chunk_idx": chunk_idx,
-                "trained_steps": trained,
-                "ac_state_dict": ac.state_dict(),
-                "algorithm_state_dict": algorithm.state_dict(),
-                "optim_state_dict": optim_state,
-                "rng": {
-                    "numpy": np.random.get_state(),
-                    "torch": torch.get_rng_state(),
-                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                },
-            }
-            torch.save(ckpt, ckpt_path)
+            # # 保存 checkpoint（模型/优化器/RNG）—— 暂时禁用
+            # ckpt_path = os.path.join(
+            #     ckpt_dir, f"ckpt_chunk_{chunk_idx:04d}_step_{trained:08d}.pt"
+            # )
+            # optim_state = _try_get_optim_state(algorithm)
+            # ckpt = {
+            #     "chunk_idx": chunk_idx,
+            #     "trained_steps": trained,
+            #     "ac_state_dict": ac.state_dict(),
+            #     "algorithm_state_dict": algorithm.state_dict(),
+            #     "optim_state_dict": optim_state,
+            #     "rng": {
+            #         "numpy": np.random.get_state(),
+            #         "torch": torch.get_rng_state(),
+            #         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            #     },
+            # }
+            # torch.save(ckpt, ckpt_path)
 
             if (not solved) and succ > 0:
                 solved = True
@@ -2268,17 +2268,17 @@ if __name__ == "__main__":
     ]
     
     # 运行批量实验 (测试用小规模配置)
-    print("Running test experiments...")
-    main_multi_schemes(
-        experiments=experiments,
-        algo_cfg=algo_cfg,
-        train_cfg=train_cfg,
-        seeds=[0, 1],
-        in_dir="task_suites",
-        suite_name="Final",
-        sampled_json_path="task_suites/Final_sampled_bin5.json",
-    )
-    print(" test experiments finished...")
+    # print("Running test experiments...")
+    # main_multi_schemes(
+    #     experiments=experiments,
+    #     algo_cfg=algo_cfg,
+    #     train_cfg=train_cfg,
+    #     seeds=[0, 1],
+    #     in_dir="task_suites",
+    #     suite_name="Final",
+    #     sampled_json_path="task_suites/Final_sampled_bin5.json",
+    # )
+    # print(" test experiments finished...")
 
     # ============================================================================
     # 正式实验：gate_seq + MLP（8 个参数量等级）
@@ -2302,15 +2302,15 @@ if __name__ == "__main__":
     mlp_train_cfg = {
         "log_dir": "logs_benchmark_MLP",
         "n_train_env": 1,
-        "total_budget_steps": 500000,
-        "eval_every_steps": 5000,
+        "total_budget_steps": 200000,   # 200k步，配合early_stop足够
+        "eval_every_steps": 2000,       # 每2k步评估，共100次评估点
         "eval_episodes": 5,
         "collect_steps": 2048,
         "update_reps": 8,
         "batch_size": 256,
-        "buffer_size": 20000,
+        "buffer_size": 10000,           # 缩小buffer，200k步够用
         "fidelity_threshold": 0.95,
-        "max_gates": 25,  #当前任务最大门数：14，最大预算steps：1.5 * 14 = 21，向上取整25
+        "max_gates": 25,  # 当前任务最大门数：14，最大预算steps：1.5 * 14 = 21，向上取整25
         "early_stop_on_success": True,
         "early_stop_consecutive_success": 3,
     }
@@ -2318,59 +2318,243 @@ if __name__ == "__main__":
     # SharedMLP 配置
     mlp_shared_cfg = {"shared_out_dim": 256, "shared_act": "silu"}
     
-    # MLP 实验配置（8 个参数量等级）
-    mlp_experiments = [
-        ("gate_seq", [
-            # ~186K params (hid=64, depth=2)
-            {"name": "MLP_h64_d2", "encoder": "mlp",
-             "hid": 64, "depth": 2, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-            # ~380K params (hid=128, depth=2)
-            {"name": "MLP_h128_d2", "encoder": "mlp",
-             "hid": 128, "depth": 2, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-            # ~792K params (hid=256, depth=2)
-            {"name": "MLP_h256_d2", "encoder": "mlp",
-             "hid": 256, "depth": 2, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-            # ~858K params (hid=256, depth=3)
-            {"name": "MLP_h256_d3", "encoder": "mlp",
-             "hid": 256, "depth": 3, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-            # ~1237K params (hid=384, depth=2)
-            {"name": "MLP_h384_d2", "encoder": "mlp",
-             "hid": 384, "depth": 2, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-            # ~1385K params (hid=384, depth=3)
-            {"name": "MLP_h384_d3", "encoder": "mlp",
-             "hid": 384, "depth": 3, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-            # ~1714K params (hid=512, depth=2)
-            {"name": "MLP_h512_d2", "encoder": "mlp",
-             "hid": 512, "depth": 2, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-            # ~1978K params (hid=512, depth=3)
-            {"name": "MLP_h512_d3", "encoder": "mlp",
-             "hid": 512, "depth": 3, "out_dim": 256,
-             "act": "silu", "use_ln": True, "dropout": 0.0,
-             **mlp_shared_cfg},
-        ]),
+    # MLP 实验配置（4 个代表性参数量等级）
+    all_mlp_cfgs = [
+        # 0: ~186K params (hid=64, depth=2) - 小型
+        {"name": "MLP_h64_d2", "encoder": "mlp",
+         "hid": 64, "depth": 2, "out_dim": 256,
+         "act": "silu", "use_ln": True, "dropout": 0.0,
+         **mlp_shared_cfg},
+        # 1: ~380K params (hid=128, depth=2) - 中小型
+        {"name": "MLP_h128_d2", "encoder": "mlp",
+         "hid": 128, "depth": 2, "out_dim": 256,
+         "act": "silu", "use_ln": True, "dropout": 0.0,
+         **mlp_shared_cfg},
+        # 2: ~858K params (hid=256, depth=3) - 中型
+        {"name": "MLP_h256_d3", "encoder": "mlp",
+         "hid": 256, "depth": 3, "out_dim": 256,
+         "act": "silu", "use_ln": True, "dropout": 0.0,
+         **mlp_shared_cfg},
+        # 3: ~1978K params (hid=512, depth=3) - 大型
+        {"name": "MLP_h512_d3", "encoder": "mlp",
+         "hid": 512, "depth": 3, "out_dim": 256,
+         "act": "silu", "use_ln": True, "dropout": 0.0,
+         **mlp_shared_cfg},
     ]
     
-    # # 运行 MLP 实验
-    # main_multi_schemes(
-    #     experiments=mlp_experiments,
-    #     algo_cfg=mlp_algo_cfg,
-    #     train_cfg=mlp_train_cfg,
-    #     seeds=[0, 1, 2, 3, 4],
-    #     in_dir="task_suites",
-    #     suite_name="Final",
-    #     sampled_json_path="task_suites/Final_sampled_bin10.json",
-    # )
+    # 解析命令行参数
+    import argparse
+    parser = argparse.ArgumentParser(description="MLP Benchmark Training")
+    parser.add_argument("--arch", type=int, default=None,
+                        help="架构索引 0-3: 0=h64_d2, 1=h128_d2, 2=h256_d3, 3=h512_d3")
+    args = parser.parse_args()
+    
+    # 选择要运行的架构
+    if args.arch is not None:
+        if not 0 <= args.arch < len(all_mlp_cfgs):
+            raise ValueError(f"--arch 必须在 0-{len(all_mlp_cfgs)-1} 之间")
+        selected = [all_mlp_cfgs[args.arch]]
+        print(f"[单架构模式] 运行: {selected[0]['name']}")
+    else:
+        selected = all_mlp_cfgs
+        print(f"[顺序模式] 依次运行全部 {len(all_mlp_cfgs)} 个架构")
+    
+    mlp_experiments = [("gate_seq", selected)]
+    
+    # 运行 MLP 实验
+    main_multi_schemes(
+        experiments=mlp_experiments,
+        algo_cfg=mlp_algo_cfg,
+        train_cfg=mlp_train_cfg,
+        seeds=[0, 1, 2, 3, 4],
+        in_dir="task_suites",
+        suite_name="Final",
+        sampled_json_path="task_suites/final_tasks.json",
+    )
+
+    # ============================================================================
+    # 其他 Schemes 实验配置（参数量对齐 MLP 的 4 个等级）
+    # 目标参数量: ~186K, ~380K, ~858K, ~1978K (±10%)
+    # ============================================================================
+    
+    # 共享配置（与 MLP 相同）
+    shared_cfg = {"shared_out_dim": 256, "shared_act": "silu"}
+    
+    # --------------------------------------------------------------------------
+    # 1. RNN 配置 (gate_seq scheme)
+    # 注意：
+    #   - post_ln/post_act/post_dropout 由 SharedMLP 负责，encoder 不处理
+    #   - out_dim = hidden_size，禁用 encoder 内部 projection，由 SharedMLP 投影
+    #   - 参数量 = Embedding + LSTM (不含 projection)
+    # --------------------------------------------------------------------------
+    all_rnn_cfgs = [
+        # 0: ~186K params - 小型
+        # Embedding: 33*64=2.1K, LSTM: 4*184*(64+184)+8*184=184K
+        {"name": "RNN_h184_e64", "encoder": "rnn",
+         "embed_dim": 64, "hidden_size": 184, "num_layers": 1,
+         "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+         "out_dim": 184,  # = hidden_size, 禁用 proj
+         "post_ln": False, "post_act": "none", "post_dropout": 0.0,
+         **shared_cfg},
+        # 1: ~380K params - 中小型
+        # Embedding: 33*96=3.2K, LSTM: 4*262*(96+262)+8*262=377K
+        {"name": "RNN_h262_e96", "encoder": "rnn",
+         "embed_dim": 96, "hidden_size": 262, "num_layers": 1,
+         "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+         "out_dim": 262,  # = hidden_size, 禁用 proj
+         "post_ln": False, "post_act": "none", "post_dropout": 0.0,
+         **shared_cfg},
+        # 2: ~856K params - 中型
+        # Embedding: 33*128=4.2K, LSTM: 4*401*(128+401)+8*401=852K
+        {"name": "RNN_h401_e128", "encoder": "rnn",
+         "embed_dim": 128, "hidden_size": 401, "num_layers": 1,
+         "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+         "out_dim": 401,  # = hidden_size, 禁用 proj
+         "post_ln": False, "post_act": "none", "post_dropout": 0.0,
+         **shared_cfg},
+        # 3: ~1.98M params - 大型
+        # Embedding: 33*160=5.3K, LSTM: 4*626*(160+626)+8*626=1973K
+        {"name": "RNN_h626_e160", "encoder": "rnn",
+         "embed_dim": 160, "hidden_size": 626, "num_layers": 1,
+         "rnn_type": "lstm", "bidirectional": False, "pool": "last",
+         "out_dim": 626,  # = hidden_size, 禁用 proj
+         "post_ln": False, "post_act": "none", "post_dropout": 0.0,
+         **shared_cfg},
+    ]
+    
+    # --------------------------------------------------------------------------
+    # 2. CNN 2d_grid 配置 (1D CNN for 2d_grid scheme)
+    # 注意：use_proj=False，禁用内部 projection，由 SharedMLP 投影
+    # 参数量 = first_conv + depth * backbone_conv (不含 projection)
+    # --------------------------------------------------------------------------
+    all_cnn_2d_cfgs = [
+        # 0: ~186K params - 小型
+        # first: 4*143*3+143=1.9K, backbone: 3*(143²*3+143)=184K
+        {"name": "CNN_2d_h143_d3", "encoder": "cnn",
+         "hid": 143, "depth": 3, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 143
+         "act": "silu", "dropout": 0.0, "mode": "grid",
+         **shared_cfg},
+        # 1: ~382K params - 中小型
+        # first: 4*205*3+205=2.7K, backbone: 3*(205²*3+205)=379K
+        {"name": "CNN_2d_h205_d3", "encoder": "cnn",
+         "hid": 205, "depth": 3, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 205
+         "act": "silu", "dropout": 0.0, "mode": "grid",
+         **shared_cfg},
+        # 2: ~860K params - 中型
+        # first: 4*267*3+267=3.5K, backbone: 4*(267²*3+267)=857K
+        {"name": "CNN_2d_h267_d4", "encoder": "cnn",
+         "hid": 267, "depth": 4, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 267
+         "act": "silu", "dropout": 0.0, "mode": "grid",
+         **shared_cfg},
+        # 3: ~1.98M params - 大型
+        # first: 4*363*3+363=4.7K, backbone: 5*(363²*3+363)=1978K
+        {"name": "CNN_2d_h363_d5", "encoder": "cnn",
+         "hid": 363, "depth": 5, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 363
+         "act": "silu", "dropout": 0.0, "mode": "grid",
+         **shared_cfg},
+    ]
+    
+    # --------------------------------------------------------------------------
+    # 3. CNN 3d_tensor 配置 (2D CNN for 3d_tensor scheme)
+    # 注意：use_proj=False，禁用内部 projection，由 SharedMLP 投影
+    # 参数量 = first_conv2d + depth * backbone_conv2d (不含 projection)
+    # 假设 in_channels=7 (typical), kernel=3x3
+    # --------------------------------------------------------------------------
+    all_cnn_3d_cfgs = [
+        # 0: ~187K params - 小型
+        # first: 7*82*9+82=5.2K, backbone: 3*(82²*9+82)=182K
+        {"name": "CNN_3d_h82_d3", "encoder": "cnn",
+         "hid": 82, "depth": 3, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 82
+         "act": "silu", "dropout": 0.0, "mode": "tensor",
+         **shared_cfg},
+        # 1: ~384K params - 中小型
+        # first: 7*118*9+118=7.6K, backbone: 3*(118²*9+118)=376K
+        {"name": "CNN_3d_h118_d3", "encoder": "cnn",
+         "hid": 118, "depth": 3, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 118
+         "act": "silu", "dropout": 0.0, "mode": "tensor",
+         **shared_cfg},
+        # 2: ~864K params - 中型
+        # first: 7*154*9+154=9.9K, backbone: 4*(154²*9+154)=854K
+        {"name": "CNN_3d_h154_d4", "encoder": "cnn",
+         "hid": 154, "depth": 4, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 154
+         "act": "silu", "dropout": 0.0, "mode": "tensor",
+         **shared_cfg},
+        # 3: ~1.98M params - 大型
+        # first: 7*209*9+209=13.4K, backbone: 5*(209²*9+209)=1967K
+        {"name": "CNN_3d_h209_d5", "encoder": "cnn",
+         "hid": 209, "depth": 5, "kernel_size": 3,
+         "use_proj": False,  # out_dim = hid = 209
+         "act": "silu", "dropout": 0.0, "mode": "tensor",
+         **shared_cfg},
+    ]
+    
+    # --------------------------------------------------------------------------
+    # 4. GIN 配置 (graph scheme)
+    # 注意：use_post_block=False，禁用 out_proj 和 post，由 SharedMLP 处理
+    # 参数量 = in_proj (LazyLinear) + depth * GIN_layer (不含 out_proj/post)
+    # 假设 node_feat_dim=24 (typical)
+    # --------------------------------------------------------------------------
+    all_gin_cfgs = [
+        # 0: ~188K params - 小型
+        # in_proj: 25*174=4.4K, GIN: 3*(2*174²+4*174+1)=184K
+        {"name": "GIN_h174_d3", "encoder": "gin",
+         "hid": 174, "depth": 3, "mlp_depth": 2,
+         "readout": "mean", "norm": "ln", "act": "silu", "dropout": 0.0,
+         "use_post_block": False,  # out_dim = hid = 174
+         **shared_cfg},
+        # 1: ~381K params - 中小型
+        # in_proj: 25*249=6.2K, GIN: 3*(2*249²+4*249+1)=375K
+        {"name": "GIN_h249_d3", "encoder": "gin",
+         "hid": 249, "depth": 3, "mlp_depth": 2,
+         "readout": "mean", "norm": "ln", "act": "silu", "dropout": 0.0,
+         "use_post_block": False,  # out_dim = hid = 249
+         **shared_cfg},
+        # 2: ~862K params - 中型
+        # in_proj: 25*376=9.4K, GIN: 3*(2*376²+4*376+1)=853K
+        {"name": "GIN_h376_d3", "encoder": "gin",
+         "hid": 376, "depth": 3, "mlp_depth": 2,
+         "readout": "mean", "norm": "ln", "act": "silu", "dropout": 0.0,
+         "use_post_block": False,  # out_dim = hid = 376
+         **shared_cfg},
+        # 3: ~1.98M params - 大型
+        # in_proj: 25*495=12.4K, GIN: 4*(2*495²+4*495+1)=1968K
+        {"name": "GIN_h495_d4", "encoder": "gin",
+         "hid": 495, "depth": 4, "mlp_depth": 2,
+         "readout": "mean", "norm": "ln", "act": "silu", "dropout": 0.0,
+         "use_post_block": False,  # out_dim = hid = 495
+         **shared_cfg},
+    ]
+    
+    # --------------------------------------------------------------------------
+    # 组合所有 schemes 的实验配置
+    # --------------------------------------------------------------------------
+    all_scheme_experiments = [
+        ("gate_seq", all_rnn_cfgs),      # RNN
+        ("2d_grid", all_cnn_2d_cfgs),    # CNN 1D
+        ("3d_tensor", all_cnn_3d_cfgs),  # CNN 2D
+        ("graph", all_gin_cfgs),         # GIN
+    ]
+    
+    # --------------------------------------------------------------------------
+    # 运行其他 schemes 实验（取消注释以运行）
+    # --------------------------------------------------------------------------
+    # for scheme, cfgs in all_scheme_experiments:
+    #     print(f"\n{'='*60}")
+    #     print(f"Running {scheme} experiments...")
+    #     print(f"{'='*60}")
+    #     main_multi_schemes(
+    #         experiments=[(scheme, cfgs)],
+    #         algo_cfg=mlp_algo_cfg,
+    #         train_cfg={**mlp_train_cfg, "log_dir": f"logs_benchmark_{scheme}"},
+    #         seeds=[0, 1, 2, 3, 4],
+    #         in_dir="task_suites",
+    #         suite_name="Final",
+    #         sampled_json_path="task_suites/final_tasks.json",
+    #     )
