@@ -1276,12 +1276,12 @@ def run_one_task(task, *, stage_name: str, scheme, net_cfg, algo_cfg, train_cfg,
                     "trained_steps": int(trained),
                     "train_trace": os.path.relpath(train_trace_path, logger.run_dir),
                     "eval_trace": os.path.relpath(eval_trace_path, logger.run_dir),
-                    "ckpt": os.path.relpath(ckpt_path, logger.run_dir),
+                    # "ckpt": os.path.relpath(ckpt_path, logger.run_dir),  # checkpoint已禁用
                 }
                 with open(chunks_index_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(chunk_entry, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[warn] Failed to write chunks.jsonl: {e}")
 
             logger.log_metrics(trained, metrics)
 
@@ -2300,7 +2300,7 @@ if __name__ == "__main__":
     
     # 训练配置
     mlp_train_cfg = {
-        "log_dir": "logs_benchmark_MLP",
+        "log_dir": "logs_benchmark_RNN",
         "n_train_env": 1,
         "total_budget_steps": 200000,   # 200k步，配合early_stop足够
         "eval_every_steps": 2000,       # 每2k步评估，共100次评估点
@@ -2341,52 +2341,7 @@ if __name__ == "__main__":
          "act": "silu", "use_ln": True, "dropout": 0.0,
          **mlp_shared_cfg},
     ]
-    
-    # 解析命令行参数
-    import argparse
-    parser = argparse.ArgumentParser(description="MLP Benchmark Training")
-    parser.add_argument("--arch", type=int, default=None,
-                        help="架构索引 0-3: 0=h64_d2, 1=h128_d2, 2=h256_d3, 3=h512_d3")
-    args = parser.parse_args()
-    
-    # 选择要运行的架构
-    if args.arch is not None:
-        if not 0 <= args.arch < len(all_mlp_cfgs):
-            raise ValueError(f"--arch 必须在 0-{len(all_mlp_cfgs)-1} 之间")
-        selected = [all_mlp_cfgs[args.arch]]
-        print(f"[单架构模式] 运行: {selected[0]['name']}")
-    else:
-        selected = all_mlp_cfgs
-        print(f"[顺序模式] 依次运行全部 {len(all_mlp_cfgs)} 个架构")
-    
-    mlp_experiments = [("gate_seq", selected)]
-    
-    # 运行 MLP 实验
-    main_multi_schemes(
-        experiments=mlp_experiments,
-        algo_cfg=mlp_algo_cfg,
-        train_cfg=mlp_train_cfg,
-        seeds=[0, 1, 2, 3, 4],
-        in_dir="task_suites",
-        suite_name="Final",
-        sampled_json_path="task_suites/final_tasks.json",
-    )
 
-    # ============================================================================
-    # 其他 Schemes 实验配置（参数量对齐 MLP 的 4 个等级）
-    # 目标参数量: ~186K, ~380K, ~858K, ~1978K (±10%)
-    # ============================================================================
-    
-    # 共享配置（与 MLP 相同）
-    shared_cfg = {"shared_out_dim": 256, "shared_act": "silu"}
-    
-    # --------------------------------------------------------------------------
-    # 1. RNN 配置 (gate_seq scheme)
-    # 注意：
-    #   - post_ln/post_act/post_dropout 由 SharedMLP 负责，encoder 不处理
-    #   - out_dim = hidden_size，禁用 encoder 内部 projection，由 SharedMLP 投影
-    #   - 参数量 = Embedding + LSTM (不含 projection)
-    # --------------------------------------------------------------------------
     all_rnn_cfgs = [
         # 0: ~186K params - 小型
         # Embedding: 33*64=2.1K, LSTM: 4*184*(64+184)+8*184=184K
@@ -2421,6 +2376,26 @@ if __name__ == "__main__":
          "post_ln": False, "post_act": "none", "post_dropout": 0.0,
          **shared_cfg},
     ]
+    
+    # 主运行逻辑移到文件末尾（在所有配置定义之后）
+    pass
+
+    # ============================================================================
+    # 其他 Schemes 实验配置（参数量对齐 MLP 的 4 个等级）
+    # 目标参数量: ~186K, ~380K, ~858K, ~1978K (±10%)
+    # ============================================================================
+    
+    # 共享配置（与 MLP 相同）
+    shared_cfg = {"shared_out_dim": 256, "shared_act": "silu"}
+    
+    # --------------------------------------------------------------------------
+    # 1. RNN 配置 (gate_seq scheme)
+    # 注意：
+    #   - post_ln/post_act/post_dropout 由 SharedMLP 负责，encoder 不处理
+    #   - out_dim = hidden_size，禁用 encoder 内部 projection，由 SharedMLP 投影
+    #   - 参数量 = Embedding + LSTM (不含 projection)
+    # --------------------------------------------------------------------------
+
     
     # --------------------------------------------------------------------------
     # 2. CNN 2d_grid 配置 (1D CNN for 2d_grid scheme)
@@ -2543,18 +2518,52 @@ if __name__ == "__main__":
     ]
     
     # --------------------------------------------------------------------------
-    # 运行其他 schemes 实验（取消注释以运行）
+    # 主运行逻辑
     # --------------------------------------------------------------------------
-    # for scheme, cfgs in all_scheme_experiments:
-    #     print(f"\n{'='*60}")
-    #     print(f"Running {scheme} experiments...")
-    #     print(f"{'='*60}")
-    #     main_multi_schemes(
-    #         experiments=[(scheme, cfgs)],
-    #         algo_cfg=mlp_algo_cfg,
-    #         train_cfg={**mlp_train_cfg, "log_dir": f"logs_benchmark_{scheme}"},
-    #         seeds=[0, 1, 2, 3, 4],
-    #         in_dir="task_suites",
-    #         suite_name="Final",
-    #         sampled_json_path="task_suites/final_tasks.json",
-    #     )
+    
+    # 解析命令行参数
+    import argparse
+    parser = argparse.ArgumentParser(description="Benchmark Training")
+    parser.add_argument("--encoder", type=str, default="mlp",
+                        choices=["mlp", "rnn", "cnn_2d", "cnn_3d", "gin"],
+                        help="编码器类型: mlp, rnn, cnn_2d, cnn_3d, gin")
+    parser.add_argument("--arch", type=int, default=None,
+                        help="架构索引 0-3")
+    args = parser.parse_args()
+    
+    # 根据 encoder 类型选择配置
+    encoder_configs = {
+        "mlp": (all_mlp_cfgs, "gate_seq", "logs_benchmark_MLP2"),
+        "rnn": (all_rnn_cfgs, "gate_seq", "logs_benchmark_RNN"),
+        "cnn_2d": (all_cnn_2d_cfgs, "2d_grid", "logs_benchmark_CNN_2d"),
+        "cnn_3d": (all_cnn_3d_cfgs, "3d_tensor", "logs_benchmark_CNN_3d"),
+        "gin": (all_gin_cfgs, "graph", "logs_benchmark_GIN"),
+    }
+    
+    all_cfgs, scheme, log_dir = encoder_configs[args.encoder]
+    
+    # 选择要运行的架构
+    if args.arch is not None:
+        if not 0 <= args.arch < len(all_cfgs):
+            raise ValueError(f"--arch 必须在 0-{len(all_cfgs)-1} 之间")
+        selected = [all_cfgs[args.arch]]
+        print(f"[单架构模式] Encoder: {args.encoder}, 运行: {selected[0]['name']}")
+    else:
+        selected = all_cfgs
+        print(f"[顺序模式] Encoder: {args.encoder}, 依次运行全部 {len(all_cfgs)} 个架构")
+    
+    experiments = [(scheme, selected)]
+    
+    # 更新训练配置的日志目录
+    train_cfg = {**mlp_train_cfg, "log_dir": log_dir}
+    
+    # 运行实验
+    main_multi_schemes(
+        experiments=experiments,
+        algo_cfg=mlp_algo_cfg,
+        train_cfg=train_cfg,
+        seeds=[0, 1, 2, 3, 4],
+        in_dir="task_suites",
+        suite_name="Final",
+        sampled_json_path="task_suites/final_tasks.json",
+    )
