@@ -416,8 +416,8 @@ class CircuitDesignerDiscrete(gym.Env):
         # tianshou 的 buffer.hasnull 会把 None 视为缺失值并直接报错（MalformedBufferError）
         # 有些任务缺少 difficulty_bin，统一用字符串占位，避免 None 进入 info
         safe_diff_bin = self.current_difficulty_bin if self.current_difficulty_bin is not None else "NA"
-        # max_steps ≈ 1.3 * L，向上取整避免过早截断
-        self.task_budget = max(1, int(np.ceil(self.gates_target * 1.3)))
+        # max_steps ≈ 1.5 * L，向上取整避免过早截断
+        self.task_budget = max(1, int(np.ceil(self.gates_target * 1.5)))
         # ---- Route A: enforce fixed qubits ----
         task_nq = int(self.target_qc.num_qubits)
         env_nq = int(self.max_qubits)  # 也就是 init 传进来的 max_qubits
