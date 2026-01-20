@@ -179,22 +179,53 @@ class Encoder_CNN(nn.Module):
     @property
     def num_params(self) -> int:
         """
-        返回可训练参数总数。
+        返回实际使用分支的可训练参数总数。
+        
+        根据 self.mode 决定计算哪个分支的参数：
+        - mode="grid": 只计算 grid 分支 (1D CNN)
+        - mode="tensor": 只计算 tensor 分支 (2D CNN)
+        - mode="auto": 计算两个分支的参数总和（不推荐，因为实际只使用一个）
         
         注意：由于使用了 LazyConv，需要先调用一次 forward 初始化模型。
-        此方法会跳过未初始化的 LazyModule 参数，只计算已初始化的部分。
         """
-        total = 0
         has_uninitialized = False
         
-        for p in self.parameters():
-            if not p.requires_grad:
-                continue
-            try:
-                total += p.numel()
-            except ValueError:
-                # UninitializedParameter from LazyModule
-                has_uninitialized = True
+        def count_module_params(module):
+            """计算一个模块的参数数量"""
+            nonlocal has_uninitialized
+            total = 0
+            for p in module.parameters():
+                if not p.requires_grad:
+                    continue
+                try:
+                    total += p.numel()
+                except ValueError:
+                    has_uninitialized = True
+            return total
+        
+        # 根据 mode 决定计算哪个分支
+        if self.mode == "grid":
+            # 只计算 grid 分支的参数
+            total = count_module_params(self.grid_first)
+            total += count_module_params(self.grid_backbone)
+            if self.grid_proj is not None:
+                total += count_module_params(self.grid_proj)
+        elif self.mode == "tensor":
+            # 只计算 tensor 分支的参数
+            total = count_module_params(self.tensor_first)
+            total += count_module_params(self.tensor_backbone)
+            if self.tensor_proj is not None:
+                total += count_module_params(self.tensor_proj)
+        else:
+            # mode="auto"：计算两个分支的参数总和（实际只会使用一个）
+            total = 0
+            for p in self.parameters():
+                if not p.requires_grad:
+                    continue
+                try:
+                    total += p.numel()
+                except ValueError:
+                    has_uninitialized = True
         
         if has_uninitialized:
             import warnings

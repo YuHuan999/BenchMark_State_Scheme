@@ -239,31 +239,55 @@ def _estimate_rnn_params(A: int, cfg: dict) -> int:
 
 
 def _estimate_cnn_params(input_channels: int, cfg: dict) -> int:
-    """估算 CNN 参数量（grid 分支）"""
+    """
+    估算 CNN 参数量。
+    
+    根据 mode 决定估算哪个分支：
+    - mode="grid": 1D CNN (Conv1d)，kernel_size 是 1D
+    - mode="tensor": 2D CNN (Conv2d)，kernel_size 是 2D (kernel_size x kernel_size)
+    
+    Args:
+        input_channels: 输入通道数
+            - grid 模式 (mode="grid"): 默认 4 (4 行作为 4 channel)
+            - tensor 模式 (mode="tensor"): 通常是 7 (gate_type channels)
+        cfg: encoder 配置字典，包含 mode, hid, depth, kernel_size, out_dim, use_proj 等
+    """
     hid = int(cfg.get("hid", 64))
     depth = int(cfg.get("depth", 3))
     kernel_size = int(cfg.get("kernel_size", 3))
     out_dim = int(cfg.get("out_dim", 256))
     use_proj = bool(cfg.get("use_proj", True))
-    grid_encoding = str(cfg.get("grid_encoding", "scalar")).lower()
-    
-    # 注意：onehot 编码会显著增加 input_channels，但这里用 scalar 估算
-    # 如果需要 onehot，需要用户指定正确的 input_channels
+    mode = str(cfg.get("mode", "grid")).lower()
     
     total = 0
     
-    # 第一层 Conv1d: in_channels -> hid
-    total += input_channels * hid * kernel_size + hid  # weight + bias
+    if mode == "tensor":
+        # ========== Tensor 分支 (2D CNN) ==========
+        # Conv2d: kernel 是 2D (kernel_size x kernel_size)
+        # 第一层 Conv2d: in_channels -> hid
+        total += input_channels * hid * kernel_size * kernel_size + hid  # weight + bias
+        
+        # 堆叠的 Conv2d layers
+        for _ in range(depth):
+            total += hid * hid * kernel_size * kernel_size + hid
+        
+        # 投影层
+        if use_proj:
+            total += hid * out_dim + out_dim
+    else:
+        # ========== Grid 分支 (1D CNN) ==========
+        # Conv1d: kernel 是 1D (kernel_size)
+        # 第一层 Conv1d: in_channels -> hid
+        total += input_channels * hid * kernel_size + hid  # weight + bias
+        
+        # 堆叠的 Conv1d layers
+        for _ in range(depth):
+            total += hid * hid * kernel_size + hid
+        
+        # 投影层
+        if use_proj:
+            total += hid * out_dim + out_dim
     
-    # 堆叠的 Conv1d layers
-    for _ in range(depth):
-        total += hid * hid * kernel_size + hid
-    
-    # 投影层
-    if use_proj:
-        total += hid * out_dim + out_dim
-    
-    # 注意：这只估算 grid 分支，tensor 分支参数量类似但使用 2D 卷积
     return total
 
 

@@ -31,6 +31,11 @@ class Encoder_RNN(nn.Module):
     - from_cfg(actions, max_gates, cfg) 工厂方法
     - forward 接受 [T]/[B,T] 的 gate token ids (padding=-1)
     - 空电路（全 padding）不报错
+    
+    增量推理模式（推理时使用）:
+    - init_hidden(batch_size) 初始化隐藏状态
+    - step(token, hidden) 单步推理，返回 (feat, new_hidden)
+    - 通过维护隐藏状态实现 O(1) 每步推理
     """
     
     def __init__(
@@ -109,9 +114,11 @@ class Encoder_RNN(nn.Module):
         self.num_layers = num_layers
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1
+        self.rnn_input_dim = rnn_input_dim  # 保存供 step() 使用
         
         # RNN 输出维度
         rnn_out_dim = hidden_size * self.num_directions
+        self.rnn_out_dim = rnn_out_dim  # 保存供 step() 使用
         
         # 输出维度
         if out_dim is None:
@@ -310,6 +317,129 @@ class Encoder_RNN(nn.Module):
         
         return x  # [B, max_gates] long
 
+    # ========================================================================
+    # 增量推理方法（推理时使用，实现 RNN 的核心优势）
+    # ========================================================================
+    
+    def init_hidden(self, batch_size: int = 1, device: torch.device | str | None = None):
+        """
+        初始化 RNN 隐藏状态（用于 episode 开始时）。
+        
+        Args:
+            batch_size: batch 大小
+            device: 目标设备，默认使用模型参数所在设备
+        
+        Returns:
+            hidden: 隐藏状态
+                - LSTM: (h_0, c_0)，每个 shape=[num_layers * num_directions, B, hidden_size]
+                - GRU: h_0，shape=[num_layers * num_directions, B, hidden_size]
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        
+        num_states = self.num_layers * self.num_directions
+        h_0 = torch.zeros(num_states, batch_size, self.hidden_size, device=device)
+        
+        if self.rnn_type == "lstm":
+            c_0 = torch.zeros(num_states, batch_size, self.hidden_size, device=device)
+            return (h_0, c_0)
+        else:  # GRU
+            return h_0
+    
+    def step(self, token, hidden):
+        """
+        单步推理：处理一个新 token，返回特征和更新后的隐藏状态。
+        
+        这是 RNN 的核心优势：
+        - O(1) 复杂度（而不是每次 O(T) 处理整个序列）
+        - 隐藏状态传递（历史信息被压缩编码在 hidden 中）
+        
+        Args:
+            token: 单个 token id，shape=[B] 或标量
+                   可以是 int、np.ndarray 或 torch.Tensor
+            hidden: 当前隐藏状态
+                   - LSTM: (h, c)
+                   - GRU: h
+        
+        Returns:
+            feat: 特征向量 [B, out_dim]
+            new_hidden: 更新后的隐藏状态（同 hidden 格式）
+        """
+        device = next(self.parameters()).device
+        
+        # 1. 准备 token 输入
+        if isinstance(token, (int, np.integer)):
+            token = torch.tensor([token], dtype=torch.long, device=device)
+        elif isinstance(token, np.ndarray):
+            token = torch.from_numpy(token).to(device)
+        else:
+            token = token.to(device)
+        
+        # 确保是 [B] 形状
+        if token.dim() == 0:
+            token = token.unsqueeze(0)
+        
+        batch_size = token.size(0)
+        
+        # 处理 padding token：-1 -> pad_id
+        token = torch.where(token < 0, torch.full_like(token, self.pad_id), token).long()
+        
+        # 2. Embedding: [B] -> [B, 1, embed_dim]
+        emb = self.embed(token).unsqueeze(1)  # [B, 1, embed_dim]
+        
+        # 3. 可选的 pre-coding layer
+        if self.pre_coding is not None:
+            emb = self.pre_coding(emb)  # [B, 1, pre_dim]
+        
+        # 4. RNN 单步：输入 [B, 1, input_dim]，输出 [B, 1, hidden_size * num_directions]
+        if self.rnn_type == "lstm":
+            output, (h_n, c_n) = self.rnn(emb, hidden)
+            new_hidden = (h_n, c_n)
+        else:  # GRU
+            output, h_n = self.rnn(emb, hidden)
+            new_hidden = h_n
+        
+        # 5. 取最后一步的输出（对于单步输入，就是唯一的输出）
+        # output: [B, 1, hidden_size * num_directions]
+        if self.bidirectional:
+            # bidirectional 时 h_n 的格式：[num_layers * 2, B, hidden_size]
+            # 取最后一层的前向和后向
+            h_fwd = h_n[-2]  # [B, hidden_size]
+            h_bwd = h_n[-1]  # [B, hidden_size]
+            pooled = torch.cat([h_fwd, h_bwd], dim=-1)  # [B, hidden_size * 2]
+        else:
+            pooled = h_n[-1]  # [B, hidden_size]
+        
+        # 6. Projection
+        if self.proj is not None:
+            out = self.proj(pooled)
+        else:
+            out = pooled
+        
+        # 7. Post processing
+        if self.post is not None:
+            out = self.post(out)
+        
+        return out, new_hidden  # [B, out_dim], hidden
+    
+    def step_batch(self, tokens, hidden, seq_lens=None):
+        """
+        批量单步推理：同时处理多个环境的下一个 token。
+        
+        这是为了支持 VectorEnv 的场景，每个环境可能处于不同的 step。
+        
+        Args:
+            tokens: token ids [B]
+            hidden: 当前隐藏状态（所有环境共享同一个 hidden 格式）
+            seq_lens: 可选，每个环境已有的序列长度（用于调试）
+        
+        Returns:
+            feat: 特征向量 [B, out_dim]
+            new_hidden: 更新后的隐藏状态
+        """
+        # 直接调用 step，因为 step 已经支持 batch
+        return self.step(tokens, hidden)
+
 
 def build_encoder_rnn(actions, max_gates: int, net_cfg: dict | None = None) -> Encoder_RNN:
     """工厂函数：train.py 里一行就能构造。"""
@@ -318,21 +448,22 @@ def build_encoder_rnn(actions, max_gates: int, net_cfg: dict | None = None) -> E
 
 if __name__ == "__main__":
     """
-    最小自检：
+    Self-test:
     - A=32, max_gates=60
-    - 测试 [60] 输入 => [1, out_dim]
-    - 测试 [4, 60] 输入（含全 padding 行） => [4, out_dim]
+    - Test [60] input => [1, out_dim]
+    - Test [4, 60] input (with all-padding row) => [4, out_dim]
+    - Test init_hidden() and step() for incremental inference
     """
     print("=" * 60)
-    print("Encoder_RNN 自检测试")
+    print("Encoder_RNN Self-Test")
     print("=" * 60)
     
-    # 模拟 actions（32 个动作）
+    # Mock actions (32 actions)
     A = 32
     actions = [f"gate_{i}" for i in range(A)]
     max_gates = 60
     
-    # 创建 encoder（使用默认配置）
+    # Create encoder (default config)
     cfg = {
         "embed_dim": 64,
         "rnn_type": "lstm",
@@ -346,43 +477,43 @@ if __name__ == "__main__":
     print(f"\n[Config] out_dim={encoder.out_dim}, vocab_size={encoder.vocab_size}, pad_id={encoder.pad_id}")
     print(f"[Config] rnn_type={encoder.rnn_type}, hidden_size={encoder.hidden_size}, pool={encoder.pool}")
     
-    # 测试 1: 单条序列 [60]（含 -1 padding）
-    print("\n--- Test 1: 输入 shape [60] ---")
+    # Test 1: single sequence [60] (with -1 padding)
+    print("\n--- Test 1: input shape [60] ---")
     gate_seq_1d = np.concatenate([
-        np.random.randint(0, A, size=30),  # 30 个有效 token
-        np.full(30, -1)                     # 30 个 padding
+        np.random.randint(0, A, size=30),  # 30 valid tokens
+        np.full(30, -1)                     # 30 padding
     ])
-    print(f"输入 shape: {gate_seq_1d.shape}")
+    print(f"input shape: {gate_seq_1d.shape}")
     out_1d = encoder(gate_seq_1d)
-    print(f"输出 shape: {out_1d.shape}")
+    print(f"output shape: {out_1d.shape}")
     assert out_1d.shape == (1, 256), f"Expected (1, 256), got {out_1d.shape}"
-    print("✓ Test 1 通过")
+    print("[PASS] Test 1")
     
-    # 测试 2: batch 输入 [4, 60]（含一个全 padding 行）
-    print("\n--- Test 2: 输入 shape [4, 60]（含全 padding 行）---")
+    # Test 2: batch input [4, 60] (with all-padding row)
+    print("\n--- Test 2: input shape [4, 60] (with all-padding row) ---")
     gate_seq_2d = np.full((4, 60), -1, dtype=np.int64)
-    gate_seq_2d[0, :20] = np.random.randint(0, A, size=20)  # 第 0 行有 20 个有效
-    gate_seq_2d[1, :40] = np.random.randint(0, A, size=40)  # 第 1 行有 40 个有效
-    gate_seq_2d[2, :5] = np.random.randint(0, A, size=5)    # 第 2 行有 5 个有效
-    # 第 3 行全是 -1（全 padding，空电路）
-    print(f"输入 shape: {gate_seq_2d.shape}")
-    print(f"各行有效长度: {[(row != -1).sum() for row in gate_seq_2d]}")
+    gate_seq_2d[0, :20] = np.random.randint(0, A, size=20)  # row 0: 20 valid
+    gate_seq_2d[1, :40] = np.random.randint(0, A, size=40)  # row 1: 40 valid
+    gate_seq_2d[2, :5] = np.random.randint(0, A, size=5)    # row 2: 5 valid
+    # row 3: all -1 (empty circuit)
+    print(f"input shape: {gate_seq_2d.shape}")
+    print(f"valid lengths per row: {[(row != -1).sum() for row in gate_seq_2d]}")
     out_2d = encoder(gate_seq_2d)
-    print(f"输出 shape: {out_2d.shape}")
+    print(f"output shape: {out_2d.shape}")
     assert out_2d.shape == (4, 256), f"Expected (4, 256), got {out_2d.shape}"
     assert not torch.isnan(out_2d).any(), "Output contains NaN!"
-    print("✓ Test 2 通过（全 padding 行不报错）")
+    print("[PASS] Test 2 (all-padding row OK)")
     
-    # 测试 3: dict 输入兼容性
-    print("\n--- Test 3: dict 输入兼容性 ---")
+    # Test 3: dict input compatibility
+    print("\n--- Test 3: dict input compatibility ---")
     obs_dict = {"state": gate_seq_2d, "other_key": None}
     out_dict = encoder(obs_dict)
-    print(f"输入: dict with 'state' key, shape {gate_seq_2d.shape}")
-    print(f"输出 shape: {out_dict.shape}")
+    print(f"input: dict with 'state' key, shape {gate_seq_2d.shape}")
+    print(f"output shape: {out_dict.shape}")
     assert out_dict.shape == (4, 256), f"Expected (4, 256), got {out_dict.shape}"
-    print("✓ Test 3 通过")
+    print("[PASS] Test 3")
     
-    # 测试 4: bidirectional + mean pooling
+    # Test 4: bidirectional + mean pooling
     print("\n--- Test 4: bidirectional + mean pooling ---")
     cfg_bi = {
         "embed_dim": 32,
@@ -395,20 +526,45 @@ if __name__ == "__main__":
     }
     encoder_bi = Encoder_RNN.from_cfg(actions=actions, max_gates=max_gates, cfg=cfg_bi)
     out_bi = encoder_bi(gate_seq_2d)
-    print(f"配置: bidirectional=True, pool='mean', out_dim=128")
-    print(f"输出 shape: {out_bi.shape}")
+    print(f"config: bidirectional=True, pool='mean', out_dim=128")
+    print(f"output shape: {out_bi.shape}")
     assert out_bi.shape == (4, 128), f"Expected (4, 128), got {out_bi.shape}"
     assert not torch.isnan(out_bi).any(), "Output contains NaN!"
-    print("✓ Test 4 通过")
+    print("[PASS] Test 4")
     
-    # 测试 5: 通过 build_encoder_rnn 工厂函数
-    print("\n--- Test 5: build_encoder_rnn 工厂函数 ---")
+    # Test 5: build_encoder_rnn factory function
+    print("\n--- Test 5: build_encoder_rnn factory ---")
     encoder_factory = build_encoder_rnn(actions, max_gates, net_cfg={"out_dim": 64})
     out_factory = encoder_factory(gate_seq_1d)
-    print(f"输出 shape: {out_factory.shape}")
+    print(f"output shape: {out_factory.shape}")
     assert out_factory.shape == (1, 64), f"Expected (1, 64), got {out_factory.shape}"
-    print("✓ Test 5 通过")
+    print("[PASS] Test 5")
+    
+    # Test 6: init_hidden() for incremental inference
+    print("\n--- Test 6: init_hidden() ---")
+    batch_size = 4
+    hidden = encoder.init_hidden(batch_size)
+    print(f"hidden state: h.shape={hidden[0].shape}, c.shape={hidden[1].shape}")
+    assert hidden[0].shape == (1, batch_size, 100), f"Expected (1, {batch_size}, 100), got {hidden[0].shape}"
+    print("[PASS] Test 6")
+    
+    # Test 7: step() for incremental inference
+    print("\n--- Test 7: step() incremental inference ---")
+    tokens = torch.randint(0, A, (batch_size,))
+    feat, new_hidden = encoder.step(tokens, hidden)
+    print(f"step output: feat.shape={feat.shape}, h.shape={new_hidden[0].shape}")
+    assert feat.shape == (batch_size, 256), f"Expected ({batch_size}, 256), got {feat.shape}"
+    print("[PASS] Test 7")
+    
+    # Test 8: multi-step incremental inference
+    print("\n--- Test 8: multi-step incremental inference ---")
+    hidden = encoder.init_hidden(batch_size)
+    for step in range(5):
+        tokens = torch.randint(0, A, (batch_size,))
+        feat, hidden = encoder.step(tokens, hidden)
+    print(f"after 5 steps: feat.shape={feat.shape}")
+    print("[PASS] Test 8")
     
     print("\n" + "=" * 60)
-    print("所有自检测试通过！")
+    print("All self-tests passed!")
     print("=" * 60)
